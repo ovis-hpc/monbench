@@ -22,3 +22,8 @@ set -x
 cd /root
 git clone https://github.com/ovis-hpc/monbench
 EOF
+
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["bash"]
