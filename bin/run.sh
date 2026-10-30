@@ -48,7 +48,10 @@
 #            is only read if a profile file sources it, and many ~/.bashrc
 #            files return early when the shell is not interactive.)
 #   slurm    run each step with srun inside an allocation (see slurm/); the
-#            steps inherit the environment of the submitting shell
+#            steps inherit the environment of the submitting shell. A
+#            SERVER_HOSTS / QUERY_HOST left empty is filled from the
+#            allocation: the last node is the query host, the others servers
+#            (at least 2 nodes). The query host may not also be a server.
 #   manual   print each step for you to run on the named node, then wait
 #
 # Dry run:
@@ -130,19 +133,37 @@ shift $((OPTIND - 1))
 [[ $# -gt 0 ]] || { usage; exit 2; }
 case "$LAUNCHER" in ssh | slurm | manual) ;; *) echo "unknown launcher '$LAUNCHER'" >&2; exit 2 ;; esac
 
-# In the Slurm launcher, empty host settings are filled from the allocation.
-if [[ "$LAUNCHER" == "slurm" ]]; then
-	[[ -n "${SLURM_JOB_ID:-}" ]] || { echo "the slurm launcher must run inside an allocation (salloc/sbatch)" >&2; exit 1; }
-	mapfile -t ALLOC < <(scontrol show hostnames "${SLURM_JOB_NODELIST}")
-	if [[ -z "${SERVER_HOSTS:-}" ]]; then
-		[[ ${#ALLOC[@]} -ge 3 ]] || { echo "need 3 nodes in the allocation, have ${#ALLOC[@]}" >&2; exit 1; }
-		export SERVER_HOSTS="${ALLOC[0]} ${ALLOC[1]}"
-		export QUERY_HOST="${QUERY_HOST:-${ALLOC[2]}}"
-	fi
-fi
-
 # shellcheck source=../bench.conf
 source "$CONF"
+
+# In the Slurm launcher, a host setting still empty after bench.conf and the
+# environment have been applied is filled from the allocation: the query host
+# is the last node, the servers are all the others. When only one of the two
+# is given, the other is taken from the remaining nodes.
+if [[ "$LAUNCHER" == "slurm" ]]; then
+	[[ -n "${SLURM_JOB_ID:-}" ]] || { echo "the slurm launcher must run inside an allocation (salloc/sbatch)" >&2; exit 1; }
+	if [[ -z "${SERVER_HOSTS:-}" || -z "${QUERY_HOST:-}" ]]; then
+		mapfile -t ALLOC < <(scontrol show hostnames "${SLURM_JOB_NODELIST}")
+		if [[ -z "${SERVER_HOSTS:-}" && -z "${QUERY_HOST:-}" ]]; then
+			[[ ${#ALLOC[@]} -ge 2 ]] || { echo "need at least 2 nodes in the allocation (servers plus a separate query host), have ${#ALLOC[@]}" >&2; exit 1; }
+			QUERY_HOST="${ALLOC[${#ALLOC[@]}-1]}"
+			SERVER_HOSTS="${ALLOC[*]:0:${#ALLOC[@]}-1}"
+		elif [[ -z "${QUERY_HOST:-}" ]]; then
+			for ((_i = ${#ALLOC[@]} - 1; _i >= 0; _i--)); do
+				[[ " ${SERVER_HOSTS} " == *" ${ALLOC[_i]} "* ]] && continue
+				QUERY_HOST="${ALLOC[_i]}"
+				break
+			done
+			[[ -n "${QUERY_HOST:-}" ]] || { echo "every node of the allocation is in SERVER_HOSTS; the query host needs a node of its own" >&2; exit 1; }
+		else
+			SERVER_HOSTS=""
+			for _n in "${ALLOC[@]}"; do
+				[[ "$_n" == "${QUERY_HOST}" ]] || SERVER_HOSTS+="${SERVER_HOSTS:+ }${_n}"
+			done
+			[[ -n "${SERVER_HOSTS}" ]] || { echo "the allocation has no node besides QUERY_HOST '${QUERY_HOST}' to act as a server" >&2; exit 1; }
+		fi
+	fi
+fi
 
 # Run ssh steps in a login shell (see "Launchers" above). 1 = yes (default).
 LOGIN_SHELL="${LOGIN_SHELL:-1}"
@@ -176,6 +197,10 @@ BASE_OUTPUT_DIR="${OUTPUT_DIR}"
 [[ -n "${QUERY_HOST:-}" ]] || { echo "QUERY_HOST must be set in bench.conf (see bench.conf.example)" >&2; exit 1; }
 read -r -a SERVERS <<<"${SERVER_HOSTS}"
 [[ ${#SERVERS[@]} -ge 1 ]] || { echo "SERVER_HOSTS must list at least one host" >&2; exit 1; }
+for _h in "${SERVERS[@]}"; do
+	[[ "$_h" != "${QUERY_HOST}" ]] ||
+		{ echo "QUERY_HOST '${QUERY_HOST}' is also in SERVER_HOSTS; the query host must be a separate node" >&2; exit 1; }
+done
 
 check_plugin() { # NAME
 	[[ -f "${BENCH_DIR}/backends/$1/${1}_backend.conf" && -f "${BENCH_DIR}/backends/$1/${1}_plugin.sh" ]] ||

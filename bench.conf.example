@@ -27,10 +27,12 @@
 BACKENDS="${BACKENDS:-}"
 
 # Server hosts (each holds one partition of the data set) and one query
-# host. The names must resolve from every node. Shared by every pair named
-# in BACKENDS above -- they are not set per pair. With the Slurm launcher,
-# unless SERVER_HOSTS is set here or in the environment, the hosts are
-# filled from the allocation instead (see README.md).
+# host, which must not be one of the servers. The names must resolve from
+# every node. Shared by every pair named in BACKENDS above -- they are not
+# set per pair. With the Slurm launcher, whichever of the two is left empty
+# (here and in the environment) is filled from the allocation: all nodes
+# except the last become servers and the last becomes the query host (at
+# least 2 nodes; see README.md).
 SERVER_HOSTS="${SERVER_HOSTS:-}"    # e.g. "node01 node02"
 QUERY_HOST="${QUERY_HOST:-}"        # e.g. "login01"
 

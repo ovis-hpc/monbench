@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Run the two-server D/SOS trial as one batch job on three nodes.
 # The first two nodes of the allocation become servers, the third the query
-# node (unless SERVER_NODES / QUERY_NODE are exported before sbatch).
+# node (unless SERVER_HOSTS / QUERY_HOST are set in bench.conf or exported
+# before sbatch). All nodes but the last become servers; at least 2 are needed.
 #
 #   sbatch slurm/monbench.sbatch                 # build serve-write write serve-query check query stop
 #   sbatch slurm/monbench.sbatch build serve-write write serve-query check live stop

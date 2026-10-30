@@ -200,10 +200,15 @@ only runs once regardless of how many pairs are configured.
 
 Select with `-l`: `bin/run.sh -l slurm all`.
 
-When the Slurm launcher is used and `SERVER_HOSTS` is not set in `bench.conf`
-or the environment, the harness fills it from the allocation: all nodes
-except the last become servers; the last becomes the query host. Override
-`SERVER_HOSTS` and `QUERY_HOST` to control the split.
+When the Slurm launcher is used, whichever of `SERVER_HOSTS` and `QUERY_HOST`
+is still empty after `bench.conf` and the environment have been applied is
+filled from the allocation: all nodes except the last become servers; the
+last becomes the query host. This needs at least 2 nodes. If only one of the
+two is given, the other is taken from the remaining nodes. Set both to
+control the split; the allocation size is then not checked.
+
+The query host must be a separate node: the run stops with an error if
+`QUERY_HOST` is also listed in `SERVER_HOSTS`, with any launcher.
 
 In manual mode, change settings in the configuration files rather than in
 the shell environment, because the commands you type on the other nodes read
