@@ -44,7 +44,8 @@ def parse_args():
     p.add_argument("--t0", type=int, default=1700000000)
     p.add_argument("--interval", type=int, default=1)
     p.add_argument("--job-len", type=int, default=500)
-    p.add_argument("--batch", type=int, default=10000)
+    p.add_argument("--batch", type=int, default=500,
+                   help="node records committed together")
     p.add_argument("--rate", type=float, default=0.0,
                    help="records per second, 0 = unthrottled")
     p.add_argument("--storage", choices=["mmos", "lsos"], default="mmos")
@@ -140,7 +141,9 @@ def main():
                     for name in template["lists"]}
 
     base = (a.node_index + 1) * 1000
-    written = errors = in_batch = 0
+    written = errors = in_batch = list_entries = 0
+    checkpoints = [[0, 0]]
+    start_epoch = time.time()
     t_write = time.monotonic()
 
     cont.begin()
@@ -171,6 +174,8 @@ def main():
                 rc = list_writers[rec["list"]].write(
                     comp, values["job_id"], seq, values["timestamp"],
                     rec, ds, rec["list"])
+                if not rc:
+                    list_entries += 1
                 if rc:
                     errors += 1
                     if errors <= 10:
@@ -180,6 +185,7 @@ def main():
             if in_batch == a.batch:
                 cont.commit()
                 cont.end()
+                checkpoints.append([round(time.monotonic() - t_write, 6), written])
                 in_batch = 0
                 cont.begin()
             if a.rate > 0:
@@ -189,6 +195,8 @@ def main():
     cont.commit()
     cont.end()
     t_indexed = time.monotonic()
+    if checkpoints[-1][1] != written:
+        checkpoints.append([round(t_indexed - t_write, 6), written])
     # The bindings do not export SOS_COMMIT_SYNC, so close() is asynchronous;
     # os.sync() flushes the written pages so the timing is comparable with
     # the C writer's synchronous close.
@@ -199,12 +207,13 @@ def main():
     print(json.dumps({
         "writer": "py", "container": a.path, "backend": a.storage,
         "node_index": a.node_index, "records": written, "errors": errors,
+        "list_entries": list_entries,
         "batch": a.batch, "rate": a.rate,
+        "start_epoch_s": round(start_epoch, 6),
         "open_s": round(t_write - t_start, 3),
         "write_s": round(t_indexed - t_write, 3),
         "close_sync_s": round(t_end - t_indexed, 3),
-        "total_s": round(t_end - t_start, 3),
-        "records_per_s": round(written / (t_end - t_write)),
+        "checkpoints": checkpoints,
     }))
     return 1 if errors else 0
 

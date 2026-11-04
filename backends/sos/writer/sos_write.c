@@ -76,6 +76,40 @@ static double now_s(void)
 	return ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
+static double now_epoch_s(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+/* Progress checkpoints: seconds since the write began and node records
+ * written so far, one per batch. They are reported raw; core/stats.py
+ * derives every rate and percentile from them. */
+struct checkpoint {
+	double t;
+	uint64_t n;
+};
+static struct checkpoint *cps;
+static size_t n_cps, cap_cps;
+
+static void add_checkpoint(double t, uint64_t n)
+{
+	if (n_cps == cap_cps) {
+		size_t cap = cap_cps ? cap_cps * 2 : 1024;
+		struct checkpoint *p = realloc(cps, cap * sizeof(*p));
+		if (!p) {
+			fprintf(stderr, "error: out of memory recording checkpoints\n");
+			exit(1);
+		}
+		cps = p;
+		cap_cps = cap;
+	}
+	cps[n_cps].t = t;
+	cps[n_cps].n = n;
+	n_cps++;
+}
+
 static const struct {
 	const char *name;
 	sos_type_t type;
@@ -506,7 +540,7 @@ int main(int argc, char **argv)
 	struct opts o = {
 		.backend = "mmos", .node_index = -1, .components = 16,
 		.samples = 5000, .t0 = 1700000000, .interval = 1,
-		.job_len = 500, .batch = 10000, .rate = 0,
+		.job_len = 500, .batch = 500, .rate = 0,
 	};
 	static struct option long_opts[] = {
 		{ "path", required_argument, 0, 'p' },
@@ -642,10 +676,12 @@ int main(int argc, char **argv)
 	}
 
 	uint64_t base = (uint64_t)(o.node_index + 1) * 1000;
-	uint64_t written = 0, in_batch = 0, errors = 0;
+	uint64_t written = 0, in_batch = 0, errors = 0, list_entries = 0;
 	uint64_t seq, c;
 	int rc;
+	double start_epoch = now_epoch_s();
 	double t_write = now_s();
+	add_checkpoint(0.0, 0);
 
 	rc = sos_begin_x(sos);
 	if (rc) {
@@ -710,6 +746,8 @@ int main(int argc, char **argv)
 					rc = write_list_entry(&list_writers[lwi], comp,
 						values[idx_job].u64, seq,
 						values[idx_ts].u64, rec);
+					if (!rc)
+						list_entries++;
 					if (rc) {
 						errors++;
 						if (errors <= 10)
@@ -724,6 +762,7 @@ int main(int argc, char **argv)
 			if (++in_batch == o.batch) {
 				sos_container_commit(sos, SOS_COMMIT_ASYNC);
 				sos_end_x(sos);
+				add_checkpoint(now_s() - t_write, written);
 				in_batch = 0;
 				sos_begin_x(sos);
 			}
@@ -743,18 +782,28 @@ int main(int argc, char **argv)
 	sos_container_commit(sos, SOS_COMMIT_ASYNC);
 	sos_end_x(sos);
 	double t_indexed = now_s();
+	if (cps[n_cps - 1].n != written)
+		add_checkpoint(t_indexed - t_write, written);
 	sos_container_close(sos, SOS_COMMIT_SYNC);
 	double t_end = now_s();
 
-	/* One JSON line, parsed by bin/node.sh and bin/run.sh. */
+	/* One JSON line, parsed by bin/node.sh and bin/run.sh. It holds raw
+	 * inputs only; core/stats.py derives every rate and percentile. */
+	size_t k;
 	printf("{\"writer\": \"c\", \"container\": \"%s\", \"backend\": \"%s\", "
-	       "\"node_index\": %d, \"records\": %" PRIu64 ", \"errors\": %" PRIu64 ", "
+	       "\"node_index\": %d, \"records\": %" PRIu64 ", "
+	       "\"list_entries\": %" PRIu64 ", \"errors\": %" PRIu64 ", "
 	       "\"batch\": %" PRIu64 ", \"rate\": %.0f, "
+	       "\"start_epoch_s\": %.6f, "
 	       "\"open_s\": %.3f, \"write_s\": %.3f, \"close_sync_s\": %.3f, "
-	       "\"total_s\": %.3f, \"records_per_s\": %.0f}\n",
-	       o.path, o.backend, o.node_index, written, errors, o.batch, o.rate,
-	       t_write - t_start, t_indexed - t_write, t_end - t_indexed,
-	       t_end - t_start, written / (t_end - t_write));
+	       "\"checkpoints\": [",
+	       o.path, o.backend, o.node_index, written, list_entries, errors,
+	       o.batch, o.rate, start_epoch,
+	       t_write - t_start, t_indexed - t_write, t_end - t_indexed);
+	for (k = 0; k < n_cps; k++)
+		printf("%s[%.6f, %" PRIu64 "]", k ? ", " : "", cps[k].t, cps[k].n);
+	printf("]}\n");
+	free(cps);
 	ds_free(&ds);
 	json_decref(tmpl_root);
 	return errors ? 1 : 0;

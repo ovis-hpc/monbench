@@ -14,6 +14,11 @@ the query set runs one or both of the following steps:
   query  Run the query REPEAT times, timing each run from the start of the
          query until the last row has been fetched.
 
+Every statistic is computed here, in the core, by core/stats.py: adapters
+and writers only supply raw inputs (query results to be timed here; writer
+counts, phase timers and checkpoints). Ingest and query results are
+summarized the same way, so they are directly comparable.
+
 The data set parameters come from the writer's metadata file, written when
 the data was written. If it names a different backend, the run stops.
 
@@ -38,11 +43,11 @@ import importlib.util
 import json
 import os
 import re
-import statistics
 import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import stats                                          # noqa: E402
 from adapter import BackendError                      # noqa: E402
 from dataset import Dataset, IDENTITY_ATTRS, read_meta  # noqa: E402
 
@@ -66,7 +71,7 @@ SERVERS = env("SERVER_HOSTS").split()
 OUTPUT_DIR = env("OUTPUT_DIR")
 LIMIT_N = env("LIMIT_N", int)
 LIVE_POLL = env("LIVE_POLL", float)
-REPEAT = env("REPEAT", int, "5")
+REPEAT = env("REPEAT", int, "20")
 QUERY_ADAPTER = os.environ.get("QUERY_ADAPTER", "")
 QUERY_FILE = os.environ.get("QUERY_FILE") or os.path.join(BENCH_DIR, "queries", "default.json")
 # See the module docstring: resolves and reports every query's text without
@@ -474,6 +479,16 @@ class Tee:
         self._file.close()
 
 
+def _ms(seconds):
+    """Seconds as milliseconds for a table cell; '-' when not available."""
+    return "-" if seconds is None else f"{seconds * 1e3:.1f}"
+
+
+def _num(value):
+    """A rate for a table cell; '-' when not available."""
+    return "-" if value is None else f"{value:,.0f}"
+
+
 class Report:
     def __init__(self, writer, adapter):
         self.writer = writer
@@ -486,10 +501,12 @@ class Report:
         item.update(fields)
         self.items.append(item)
         timing = ""
-        if "median_s" in fields:
-            timing = f"{fields['median_s'] * 1e3:10.1f} {fields['p95_s'] * 1e3:10.1f}"
+        if "latency_s" in fields:
+            lat, thr = fields["latency_s"], fields["throughput_per_s"]
+            timing = (f"{_ms(lat['p50']):>10} {_ms(lat['p95']):>10} "
+                      f"{_num(thr['p50']):>12}")
         rows = fields.get("rows", "")
-        print(f"  {status:5} {label:{self.width}} {rows:>8} {timing:21}  {detail}")
+        print(f"  {status:5} {label:{self.width}} {rows:>8} {timing:34}  {detail}")
 
     def failed(self):
         return any(i["status"] == "FAIL" for i in self.items)
@@ -558,17 +575,21 @@ def collect(adapter, text):
 
 
 def timed_run(adapter, text):
-    """Time one run: from the start of the query until the last row is fetched."""
+    """Time one run: from the start of the query until the last row is fetched.
+
+    Returns (seconds, rows, seconds until the first batch had been fetched).
+    A query that returns no batch at all has no first batch; its time to
+    first batch is its whole duration.
+    """
     begin = time.perf_counter()
     n = 0
+    first = None
     for batch in adapter.query(text):
         n += adapter.count(batch)
-    return time.perf_counter() - begin, n
-
-
-def percentile(values, p):
-    ordered = sorted(values)
-    return ordered[min(len(ordered) - 1, int(round(p / 100 * (len(ordered) - 1))))]
+        if first is None:
+            first = time.perf_counter() - begin
+    total = time.perf_counter() - begin
+    return total, n, total if first is None else first
 
 
 def run_query_set(rep, adapter, queries, mode="both"):
@@ -576,7 +597,12 @@ def run_query_set(rep, adapter, queries, mode="both"):
     do_time  = mode in ("query", "both")
     rep.width = max(len(f"[{q['type']}] {q['name']}") for q in queries)
     if do_time:
-        print(f"  {'':5} {'query':{rep.width}} {'rows':>8} {'median ms':>10} {'p95 ms':>10}  detail")
+        print(f"  {'':5} {'query':{rep.width}} {'rows':>8} {'p50 ms':>10} {'p95 ms':>10} "
+              f"{'rows/s p50':>12}  detail")
+        needed = stats.min_samples(95)
+        if REPEAT < needed:
+            print(f"  note: REPEAT={REPEAT}; p95 is reported from {needed} runs "
+                  f"({stats.min_samples(99)} for p99), so it shows '-' here")
     else:
         print(f"  {'':5} {'query':{rep.width}} {'rows':>8}  detail")
     for q in queries:
@@ -623,11 +649,12 @@ def run_query_set(rep, adapter, queries, mode="both"):
             continue
 
         # 2. Timed runs (query and both modes).
-        times = []
+        times, firsts = [], []
         try:
             for i in range(REPEAT):
-                t, n = timed_run(adapter, native_query)
+                t, n, first = timed_run(adapter, native_query)
                 times.append(t)
+                firsts.append(first)
                 if nrows == 0 and i == 0:
                     nrows = n       # first timed run establishes the baseline in query-only mode
                 elif n != nrows:
@@ -636,9 +663,7 @@ def run_query_set(rep, adapter, queries, mode="both"):
             status, detail = "FAIL", f"timed run failed: {type(e).__name__}: {e}"
         fields = {"query": q["query"], "rows": nrows, "times_s": [round(t, 6) for t in times]}
         if times:
-            med = statistics.median(times)
-            fields.update(median_s=med, p95_s=percentile(times, 95), min_s=min(times),
-                          rows_per_s=round(nrows / med) if med > 0 else None)
+            fields.update(stats.egress(times, nrows, firsts))
         rep.add(label, status, detail, **fields)
 
 
@@ -659,40 +684,39 @@ def load_dataset(writer, live):
 
 
 def load_ingest_results(writer):
-    """Read the write result files for WRITER and return structured data."""
+    """Read the raw write results of WRITER and compute their statistics.
+
+    Each writer leaves one JSON line of raw inputs per server (see the
+    docstring of core/stats.py); every derived number -- rates, window
+    percentiles, wall time -- is computed here, by core/stats.py, the same
+    way for every backend.
+    """
     import glob
     pattern = os.path.join(OUTPUT_DIR, "results", f"write-{writer}-*.json")
-    files = sorted(glob.glob(pattern))
-    hosts = []
-    for f in files:
+    found = []                      # (host, raw dict) or (host, error text)
+    for f in sorted(glob.glob(pattern)):
         host = os.path.basename(f).replace(f"write-{writer}-", "").replace(".json", "")
         try:
             with open(f) as fh:
-                d = json.load(fh)
+                raw = json.load(fh)
         except Exception:
-            hosts.append({"host": host, "error": f"could not read {f}"})
+            found.append((host, f"could not read {f}"))
             continue
-        hosts.append({
-            "host": host,
-            "backend": WRITE_BACKEND,
-            "writer": d.get("writer", "-"),
-            "storage": d.get("backend", "-"),
-            "records": d.get("records"),
-            "write_s": d.get("write_s"),
-            "sync_s": d.get("close_sync_s"),
-            "records_per_s": d.get("records_per_s"),
-        })
-    ok = [h for h in hosts if "error" not in h and isinstance(h.get("records"), (int, float))]
-    summary = {}
-    if ok:
-        summary = {
-            "total_records": sum(h["records"] for h in ok),
-            "max_write_s": max(h["write_s"] for h in ok if h.get("write_s")),
-            "max_sync_s": max((h["sync_s"] for h in ok if h.get("sync_s")), default=0),
-        }
-        elapsed = summary["max_write_s"] + summary["max_sync_s"]
-        if elapsed > 0:
-            summary["aggregate_records_per_s"] = round(summary["total_records"] / elapsed)
+        if not all(isinstance(raw.get(k), (int, float)) for k in ("records", "write_s")):
+            found.append((host, f"{f} has no records/write_s"))
+            continue
+        found.append((host, raw))
+    raws = [r for _, r in found if isinstance(r, dict)]
+    summary, per_host = stats.ingest_summary(raws) if raws else ({}, [])
+    per_host = iter(per_host)
+    hosts = []
+    for host, raw in found:
+        if isinstance(raw, str):
+            hosts.append({"host": host, "error": raw})
+            continue
+        hosts.append({"host": host, "backend": WRITE_BACKEND,
+                      "writer": raw.get("writer", "-"),
+                      "storage": raw.get("backend", "-"), **next(per_host)})
     return {"hosts": hosts, "summary": summary}
 
 
@@ -703,26 +727,35 @@ def print_ingest_summary(ingest):
         print("  (no ingest result files found)")
         return
     hw = max(len(h.get("host", "")) for h in hosts)
-    hw = max(hw, len("total/max"))
-    print(f"  {'host':{hw}}  {'writer':>6}  {'records':>10}  {'write_s':>8}"
-          f"  {'sync_s':>7}  {'records/s':>10}")
+    hw = max(hw, len("all hosts"))
+    print(f"  {'host':{hw}}  {'writer':>6}  {'records':>10}  {'write_s':>8}  {'sync_s':>7}"
+          f"  {'records/s':>10}  {'durable/s':>10}  {'win p50/s':>10}  {'win p95/s':>10}")
     for h in hosts:
         host = h.get("host", "?")
         if "error" in h:
             print(f"  {host:{hw}}  {h['error']}")
             continue
-        def num(key, spec):
-            v = h.get(key)
-            return spec.format(v) if isinstance(v, (int, float)) else "-"
-        print(f"  {host:{hw}}  {h.get('writer','-'):>6}  {num('records', '{:>10d}')}"
-              f"  {num('write_s', '{:>8.2f}')}"
-              f"  {num('sync_s', '{:>7.2f}')}"
-              f"  {num('records_per_s', '{:>10d}')}")
+        thr = h["throughput_per_s"]
+        print(f"  {host:{hw}}  {h.get('writer','-'):>6}  {h['records']:>10d}"
+              f"  {h['write_s']:>8.2f}  {h['sync_s']:>7.2f}"
+              f"  {_num(h['records_per_s']):>10}  {_num(h['durable_records_per_s']):>10}"
+              f"  {_num(thr['p50']):>10}  {_num(thr['p95']):>10}")
     sm = ingest.get("summary", {})
-    if sm:
-        print(f"  {'total/max':{hw}}  {'':>6}  {sm.get('total_records',0):>10d}"
-              f"  {sm['max_write_s']:>8.2f}  {sm['max_sync_s']:>7.2f}"
-              f"  {sm.get('aggregate_records_per_s','-'):>10}")
+    if not sm:
+        return
+    thr = sm["throughput_per_s"]
+    print(f"  {'all hosts':{hw}}  {'':>6}  {sm['total_records']:>10d}"
+          f"  {sm['write_wall_s']:>8.2f}  {sm['durable_wall_s'] - sm['write_wall_s']:>7.2f}"
+          f"  {_num(sm['records_per_s']):>10}  {_num(sm['durable_records_per_s']):>10}"
+          f"  {_num(thr['p50']):>10}  {_num(thr['p95']):>10}")
+    every = next((h["window_records"] for h in hosts if "error" not in h), None)
+    imbalance = sm["host_imbalance"]
+    imbalance = "-" if imbalance is None else f"{imbalance:.2f}x"
+    print(f"  windows: {thr['n']} of {every} records each, pooled over the hosts; "
+          f"a percentile shows '-' below {stats.min_samples(95)} windows (p95) "
+          f"or {stats.min_samples(99)} (p99)")
+    print(f"  all hosts: wall time on a {sm['wall_basis']} basis; "
+          f"fastest/slowest host {imbalance}")
 
 
 def run_checks(writer, query_file, mode="both"):
@@ -870,7 +903,7 @@ def main():
             "verified": item["status"] in ("PASS", "FAIL"),
         }
         # Timing fields (present when timed runs succeeded)
-        for key in ("median_s", "p95_s", "min_s", "rows_per_s", "times_s"):
+        for key in ("times_s", "latency_s", "throughput_per_s", "first_batch_s"):
             if key in item:
                 entry[key] = item[key]
         if item.get("query"):

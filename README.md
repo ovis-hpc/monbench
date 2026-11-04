@@ -172,7 +172,7 @@ through one of three **launchers**: `ssh`, `slurm`, or `manual`.
 | `write` | Write the data set: each server writes its own partition, once per writer in `WRITERS`. After all servers finish, the harness records a metadata file | each server node (parallel) |
 | `serve-query` | Start the query backend's service, if it differs from the write backend. Skipped when they are the same or the query backend needs no service | each server node |
 | `check` | Run each query once, untimed, and verify the full result against the data set. No timing is recorded | query node |
-| `query` | Run each query `REPEAT` times and time each run. No verification is performed. Reports median, p95 and minimum | query node |
+| `query` | Run each query `REPEAT` times and time each run. No verification is performed. Reports latency (p50, p95), rows per second and time to first batch | query node |
 | `live` | Write at a controlled rate while the query node polls it, checking that every answer is valid and the row count never decreases | servers + query node |
 | `stop` | Stop both backend services. Removes nothing | each server node |
 | `clean` | Stop both services, then remove `nodes/`, `meta/` and backend data kept outside `OUTPUT_DIR`. Keeps `results/` and `logs/` | each server node and the query node |
@@ -286,11 +286,21 @@ and reported as INFO.
 
 ### Timing
 
-The `query` phase runs each query `REPEAT` times (default 5) and records
+The `query` phase runs each query `REPEAT` times (default 20) and records
 the duration of each run, from the start of `adapter.query()` until the
-last row has been fetched. It reports the median, p95 and minimum. The
-connection to the backend is made once, before any query, so timings do not
-include connecting.
+last row has been fetched. The connection to the backend is made once,
+before any query, so timings do not include connecting.
+
+Ingest and query results use the same statistics, all computed by
+`core/stats.py` from raw measurements (backends compute none): `n`, `min`,
+`p50`, `p90`, `p95`, `p99`, `max`, `mean` and `stddev`, for latency and for
+throughput. For ingest, each write batch (`BATCH` node records, default 500)
+is one sample; for queries, each timed run is one. A percentile is reported
+only when there are enough samples for it to be more than the maximum: p90
+needs 10, p95 needs 20 and p99 needs 100, and is shown as `-` otherwise. The
+defaults give 160 ingest samples per server at 80,000 records and 20 runs
+per query, so p50, p90 and p95 are always available; raise `REPEAT` to 100
+for p99 of queries.
 
 `QUERY_ADAPTER` selects the adapter within the backend; empty selects the
 backend's default. Each backend's README lists its available adapters.
@@ -442,14 +452,18 @@ own query file.
 
 ## Output
 
-- `results/write-<writer>-<host>.json`: one JSON object per writer run,
-  including records written, time to write, time for the final sync, and
-  records per second.
+- `results/write-<writer>-<host>.json`: one JSON object per writer run, with
+  the raw measurements: records written, time to write, time for the final
+  sync, and a checkpoint after every batch. Rates and percentiles are not in
+  this file; the benchmark result below holds them.
 - `results/meta/dataset-<writer>.json`: what was written by each writer (the
   data set parameters and writer identity).
 - `results/benchmark-<writer>-<adapter>.json`: each query with its
-  expanded query string, status, row count, every timed run, median, p95,
-  minimum and rows per second.
+  expanded query string, status, row count, every timed run, and the
+  latency, throughput and time-to-first-batch statistics. It also holds the
+  ingest statistics: records per second (write only and including the final
+  sync) per server and for the whole write phase, and latency and throughput
+  percentiles over the write batches.
 - `results/benchmark-<writer>-live.json`: live-poll result.
 - `logs/`: the full output of every remote step.
 

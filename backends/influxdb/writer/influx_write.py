@@ -23,7 +23,9 @@ Two interfaces, chosen by --interface:
   http    POST line protocol to the InfluxDB 3 write API with urllib
 
 The write timing (write_s) covers sending every record and flushing; there is
-no separate durable-sync step as with SOS, so close_sync_s is 0.
+no separate durable-sync step as with SOS, so close_sync_s is 0. One request
+carries --batch node records (and their list-attribute lines); a checkpoint
+is recorded after each request completes.
 """
 import argparse
 import json
@@ -56,7 +58,8 @@ def parse_args():
     p.add_argument("--t0", type=int, default=1700000000)
     p.add_argument("--interval", type=int, default=1)
     p.add_argument("--job-len", type=int, default=500)
-    p.add_argument("--batch", type=int, default=10000, help="records per request/batch")
+    p.add_argument("--batch", type=int, default=500,
+                   help="node records per write request")
     p.add_argument("--rate", type=float, default=0.0, help="records/s, 0 = unthrottled")
     p.add_argument("--interface", choices=["python", "http"], default="python")
     p.add_argument("--host", required=True)
@@ -202,22 +205,27 @@ def main():
                 t0=a.t0, interval=a.interval, job_len=a.job_len)
     writer = HttpWriter(a) if a.interface == "http" else PythonWriter(a)
 
-    # 'written' counts node-level samples only (what DS.size() and every
-    # other writer's "records" field count), even though buf also carries
-    # each sample's list-attribute lines -- a dataset with list
-    # attributes sends more lines than 'written' implies, but 'written'
-    # stays comparable across backends and across datasets with or
-    # without list attributes.
-    written = 0
+    # 'written' counts node-level samples, as in every other writer. A
+    # batch is `--batch` of them, sent as one request together with their
+    # list-attribute lines.
+    batch = max(a.batch, 1)
+    written = list_entries = in_batch = 0
     buf = []
+    checkpoints = [[0, 0]]
+    start_epoch = time.time()
     t_start = time.monotonic()
     for comp, seq, values in records(a, ds):
         buf.append(line(a.measurement, comp, seq, values, ds))
-        buf.extend(list_lines(a.measurement, comp, seq, values, ds))
+        extra = list_lines(a.measurement, comp, seq, values, ds)
+        buf.extend(extra)
+        list_entries += len(extra)
         written += 1
-        if len(buf) >= a.batch:
+        in_batch += 1
+        if in_batch >= batch:
             writer.write(buf)
             buf.clear()
+            in_batch = 0
+            checkpoints.append([round(time.monotonic() - t_start, 6), written])
             if a.rate > 0:
                 due = t_start + written / a.rate
                 wait = due - time.monotonic()
@@ -226,16 +234,19 @@ def main():
     if buf:
         writer.write(buf)
     t_written = time.monotonic()
+    if checkpoints[-1][1] != written:
+        checkpoints.append([round(t_written - t_start, 6), written])
     writer.close()
 
     print(json.dumps({
         "writer": "influx", "measurement": a.measurement,
         "backend": f"influxdb/{a.interface}", "node_index": a.node_index,
-        "records": written, "errors": 0, "batch": a.batch, "rate": a.rate,
+        "records": written, "list_entries": list_entries, "errors": 0,
+        "batch": a.batch, "rate": a.rate,
+        "start_epoch_s": round(start_epoch, 6),
         "write_s": round(t_written - t_start, 3),
         "close_sync_s": 0.0,
-        "total_s": round(time.monotonic() - t_start, 3),
-        "records_per_s": round(written / (t_written - t_start)) if t_written > t_start else 0,
+        "checkpoints": checkpoints,
     }))
     return 0
 

@@ -89,15 +89,21 @@ SAMPLES="${SAMPLES:-5000}"
 T0="${T0:-1700000000}"          # timestamp of sample 0 (seconds)
 INTERVAL="${INTERVAL:-1}"        # seconds between samples (integer)
 JOB_LEN="${JOB_LEN:-500}"        # samples per job; jobs span all servers
-BATCH="${BATCH:-10000}"          # records per write transaction
+# Node records per write batch (one transaction or request). The core times
+# every batch: it is the latency sample for ingest statistics, so a server
+# with R records yields R / BATCH samples. p95 needs at least 20 batches per
+# server and p99 at least 100; the default gives 160 at 80,000 records.
+BATCH="${BATCH:-500}"
 
 # ---------------------------------------------------------------- queries
 # Query adapter within the query backend; empty selects its default.
 QUERY_ADAPTER="${QUERY_ADAPTER:-}"
 # Query set run by the check phase. Empty selects queries/default.json.
 QUERY_FILE="${QUERY_FILE:-}"
-# Timed runs per query, after one untimed run that is verified.
-REPEAT="${REPEAT:-5}"
+# Timed runs per query, after one untimed run that is verified. These are
+# the latency samples for query statistics; p95 needs at least 20 runs and
+# p99 at least 100 (a percentile with fewer samples is reported as '-').
+REPEAT="${REPEAT:-20}"
 # Value of the {limit} placeholder in query sets.
 LIMIT_N="${LIMIT_N:-100}"
 

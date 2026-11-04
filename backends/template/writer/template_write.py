@@ -9,7 +9,9 @@ in that partition, and writes the expected values to the backend's
 storage.
 
 After writing, it prints exactly one JSON summary line to stdout (see
-backends/README.md for the required fields).
+backends/README.md for the required fields). The line holds raw inputs
+only -- counts, phase timers and checkpoints; core/stats.py derives every
+rate and percentile from them.
 
 See core/dataset.py for the Dataset API, core/valuegen.py for the
 value-generation design, and EXTENDING.md for the full extension guide.
@@ -40,8 +42,8 @@ def parse_args():
     p.add_argument("--t0", type=int, default=1700000000)
     p.add_argument("--interval", type=int, default=1)
     p.add_argument("--job-len", type=int, default=500)
-    p.add_argument("--batch", type=int, default=10000,
-                   help="records per write batch")
+    p.add_argument("--batch", type=int, default=500,
+                   help="node records per write batch")
     p.add_argument("--rate", type=float, default=0.0,
                    help="records/s throttle, 0 = unthrottled")
 
@@ -99,7 +101,10 @@ def main():
 
     written = 0
     errors = 0
+    list_entries = 0
+    checkpoints = [[0, 0]]
     base = (a.node_index + 1) * 1000
+    start_epoch = time.time()
     t_start = time.monotonic()
 
     for seq in range(a.samples):
@@ -119,10 +124,15 @@ def main():
             if list_records:
                 try:
                     write_list_entries(conn, comp, seq, list_records, ds)
+                    list_entries += len(list_records)
                 except Exception:
                     errors += 1
 
             written += 1
+
+            # End of a batch: commit or flush here, then record a checkpoint.
+            if a.batch > 0 and written % a.batch == 0:
+                checkpoints.append([round(time.monotonic() - t_start, 6), written])
 
             # Optional throttle.
             if a.rate > 0:
@@ -132,19 +142,20 @@ def main():
                     time.sleep(wait)
 
     t_written = time.monotonic()
+    if checkpoints[-1][1] != written:
+        checkpoints.append([round(t_written - t_start, 6), written])
     close_sync_s = close(conn)
-    t_end = time.monotonic()
 
     # One JSON summary line to stdout -- required by the harness.
     print(json.dumps({
         "writer": "template", "target": a.target,
         "backend": "template", "node_index": a.node_index,
-        "records": written, "errors": errors, "batch": a.batch, "rate": a.rate,
+        "records": written, "list_entries": list_entries, "errors": errors,
+        "batch": a.batch, "rate": a.rate,
+        "start_epoch_s": round(start_epoch, 6),
         "write_s": round(t_written - t_start, 3),
         "close_sync_s": round(close_sync_s, 3),
-        "total_s": round(t_end - t_start, 3),
-        "records_per_s": (round(written / (t_written - t_start))
-                          if t_written > t_start else 0),
+        "checkpoints": checkpoints,
     }))
     return 0
 

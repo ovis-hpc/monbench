@@ -1,7 +1,5 @@
 # monbench extension guide
 
-Oct 2, 2026 · @Nichamon
-
 How to add a new database backend, define a custom dataset, or write a query file for the monbench benchmark suite.
 
 ## Overview
@@ -65,17 +63,31 @@ Sourced by `bin/node.sh` on the node where a step runs. It defines shell functio
 | `plugin_serve_status` | (none) | Return 0 when the service is ready |
 | `plugin_clean` | `SERVER_ID` | Delete backend data this server keeps outside `nodes/<hostname>/` (the services are already stopped). `die` instead of deleting if a daemon you did not start still holds the data |
 
-The `plugin_write` hook receives `dataset_args`, an array with the flags every writer should accept: `--components N --samples N --t0 SECS --interval SECS --job-len N --batch N --rate RECS_PER_SEC`. Your writer must produce records that match the value rules in `core/dataset.py` exactly — the query engine verifies every answer against them.
+The `plugin_write` hook receives `dataset_args`, an array with the flags every writer should accept: `--components N --samples N --t0 SECS --interval SECS --job-len N --batch N --rate RECS_PER_SEC`. `--batch` is the number of node records the writer commits or sends together; the core times each batch, so it is the unit of ingest latency. Your writer must produce records that match the value rules in `core/dataset.py` exactly — the query engine verifies every answer against them.
 
 The `plugin_write` arguments in order: `$1` = WRITER (the writer name), `$2` = MODE (`full` or `live`), `$3` = INDEX (the partition index, 0-based), `$4` = SERVER\_ID. The plugin constructs its own storage target name using `ds_name()` (see "Plugin meta files" below) — the core does not pass a target. MODE is only relevant if the backend distinguishes between a full write and a live (streaming) write. In `live` mode, `dataset_args` includes a positive `--rate` so the writer throttles its output; in `full` mode, `--rate 0` means unthrottled.
 
-The writer's summary line is a single JSON object on stdout, for example:
+The writer's summary line is a single JSON object on stdout. It carries **raw inputs only**: counts, phase timers and progress checkpoints. A writer computes no rate, no percentile and no total time; `core/stats.py` derives all of them, the same way for every backend. For example:
 
 ```json
-{"writer": "influx", "measurement": "monitoring", "backend": "influxdb/python", "node_index": 0, "records": 80000, "errors": 0, "batch": 10000, "write_s": 7.73, "close_sync_s": 0.0, "total_s": 7.73, "records_per_s": 10344}
+{"writer": "influx", "measurement": "monitoring", "backend": "influxdb/python", "node_index": 0, "records": 80000, "list_entries": 0, "errors": 0, "batch": 500, "rate": 0, "start_epoch_s": 1767225600.123456, "write_s": 7.73, "close_sync_s": 0.0, "checkpoints": [[0, 0], [0.048, 500], [0.097, 1000], ..., [7.73, 80000]]}
 ```
 
-The harness records it and prints these fields: `writer`, `records`, `write_s`, `close_sync_s`, `records_per_s`.
+| Field | Meaning |
+| --- | --- |
+| `records` | Node records written (list-attribute entries are counted separately) |
+| `list_entries` | List-attribute entries written; 0 for a dataset without list attributes |
+| `errors` | Writes that failed |
+| `batch`, `rate` | The `--batch` and `--rate` the writer ran with, echoed |
+| `start_epoch_s` | Wall-clock time (Unix seconds) at which the write began; lets the core place the hosts' writes on one time line |
+| `open_s` | Time to open the container or connection, if the backend has such a step (optional) |
+| `write_s` | First record inserted until the last record committed |
+| `close_sync_s` | Close and flush to stable storage; `0` if the backend has no such step |
+| `checkpoints` | `[[seconds since the write began, records written so far], ...]`, starting with `[0, 0]`. Add one entry after every batch has been committed or its request acknowledged, and a final one when the write finishes |
+
+The core turns each interval between two checkpoints into one sample (its duration is the batch's latency; records divided by duration is its throughput) and reports the same summary for every backend: `n`, `min`, `p50`, `p90`, `p95`, `p99`, `max`, `mean`, `stddev`. Nothing assumes a data set size, a batch size or a host count. A trailing batch smaller than `--batch` is left out of the distributions but kept in the totals, and a percentile is reported only when there are enough batches for it (20 for p95, 100 for p99). See `OUTPUT.md`, "Statistics".
+
+The harness saves the line to `results/write-<writer>-<host>.json`.
 
 ### Plugin meta files
 
@@ -199,7 +211,7 @@ files. See `OUTPUT.md` for the full specification of each file's structure.
 
 | File pattern | Written by | Contents |
 | --- | --- | --- |
-| `write-<writer>-<host>.json` | each writer | Write throughput summary for that host |
+| `write-<writer>-<host>.json` | each writer | The writer's raw output for that host (counts, timers, checkpoints) |
 | `benchmark-<writer>-<adapter>.json` | `core/bench.py` | Combined benchmark result (write + query stats) |
 | `benchmark-<writer>-live.json` | `core/bench.py` | Live-poll benchmark result |
 
