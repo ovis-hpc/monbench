@@ -33,7 +33,7 @@ valuegen.generate_node_sample(). Dataset exposes this as expected_lists()
 (every instance's every attribute, for display/debugging) and, for the
 verifier's narrower needs, expected_length() and expected_list_value()
 (Sec 6.5's expected_length()/evaluate(attr, C_i), recomputed directly
-without generating a list's whole sample). core/bench.py's verifier
+without generating a list's whole sample). core/egress.py's verifier
 implements Sec 6.5's condition grammar (name[i].attr / name[*].attr /
 count(name)) against these, used to filter the expected *node* row set a
 query should return. What it does not do is validate a list attribute's
@@ -54,7 +54,7 @@ The backend plugin separately records storage-specific information (the
 target name it chose, paths, database names, etc.) in an ingest-handoff
 meta file at <OUTPUT_DIR>/meta/ingest-handoff-<writer>.json. The query
 engine reads that
-to discover where the data lives (see core/bench.py's _read_plugin_meta()).
+to discover where the data lives (see core/egress.py's _read_plugin_meta()).
 
 Command line (used by bin/node.sh):
   dataset.py meta WRITER MODE    write the metadata file for WRITER
@@ -213,7 +213,7 @@ class Dataset:
 
         Recomputes via valuegen.list_length() directly, without
         generating the list's entry values -- the cheap primitive
-        core/bench.py's verifier needs for a 'count(name) cmp n'
+        core/egress.py's verifier needs for a 'count(name) cmp n'
         condition and for bounds-checking an indexed 'name[i].attr'
         condition.
         """

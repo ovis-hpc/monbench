@@ -1,12 +1,12 @@
 """Template query adapter. Copy this directory to backends/<name>/query/
 and rename this file to <name>_query.py.
 
-See core/adapter.py for the interface and backends/README.md for the rules.
+See core/egress_adapter.py for the interface and backends/README.md for the rules.
 """
-from adapter import Adapter, BackendError
+from egress_adapter import EgressAdapter, BackendError
 
 
-class TemplateAdapter(Adapter):
+class TemplateAdapter(EgressAdapter):
     name = "template"          # QUERY_ADAPTER value, and query-set key
     dialect = "template"       # query language; query sets may key on it
 

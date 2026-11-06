@@ -46,7 +46,7 @@ from `INFLUX_HOST` and comparing it with the current node's `$HOST`
 (`hostname -s`); when they don't match, the serve and clean hooks return
 immediately.
 
-Every `SERVER_HOSTS` entry, however, runs its own `influx_write.py` process —
+Every `SERVER_HOSTS` entry, however, runs its own `core/ingest.py` process (with the `influx` ingest adapter, `writer/influx_write.py`) —
 that's the sense in which this backend supports multiple server hosts: each
 host generates and sends its own partition of the data set (a disjoint
 slice of component IDs) to the one real server, so together they write the
@@ -136,19 +136,19 @@ node measurement to the list attribute's measurement this way, filters on
 the list's fields (and `entry_index` for the `name[i]` form, or a
 `GROUP BY component_id, time HAVING COUNT(*) ...` subquery for
 `count(name)`), and selects the *node* measurement's columns -- so the
-result is still node-shaped rows that `core/bench.py`'s existing
+result is still node-shaped rows that `core/egress.py`'s existing
 verifier (which recomputes the expected node-row set, not list-attribute
 entry rows) can check unchanged. See `queries/curated_metrics.json` for
 worked examples against `dataset/curated_metrics_like.json`.
 
 A dataset with no list attributes declared (e.g. `dataset/default.json`)
-writes and queries exactly as before -- `influx_write.py` writes no
+writes and queries exactly as before -- the `influx` adapter writes no
 list-attribute measurements and `queries/default.json` has no `match.where`
 of this form.
 
 ## Write methods
 
-One writer, `writer/influx_write.py`, with a selectable interface:
+One ingest adapter, `writer/influx_write.py` (run by `core/ingest.py`, which does the timing), with a selectable interface. `write()` buffers a node record's lines and `commit()` sends the batch in one request and returns when the server has accepted it; there is no sync step, so `sync_s` is 0:
 
 | `INFLUX_INTERFACE` | How it writes | Extra dependency |
 |---|---|---|

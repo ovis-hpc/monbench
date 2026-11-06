@@ -56,38 +56,68 @@ Sourced by `bin/node.sh` on the node where a step runs. It defines shell functio
 | Hook | Signature | Purpose |
 | --- | --- | --- |
 | `plugin_build` | (none) | Compile writers if needed |
-| `plugin_write` | `WRITER MODE INDEX SERVER_ID` | Write partition `INDEX` of the dataset, print one JSON summary line. The plugin constructs its own storage target name (see "Plugin meta files" below) |
+| `plugin_write` | `WRITER MODE INDEX SERVER_ID` | Write partition `INDEX` of the dataset by running the ingest engine, which saves the raw result. The plugin constructs its own storage target name (see "Plugin meta files" below) |
 | `plugin_serve_start` | `SERVER_ID` | Start the database service in the background |
 | `plugin_serve_run` | `SERVER_ID` | Run the service in the foreground (Slurm launcher) |
 | `plugin_serve_stop` | (none) | Stop the service |
 | `plugin_serve_status` | (none) | Return 0 when the service is ready |
 | `plugin_clean` | `SERVER_ID` | Delete backend data this server keeps outside `nodes/<hostname>/` (the services are already stopped). `die` instead of deleting if a daemon you did not start still holds the data |
 
-The `plugin_write` hook receives `dataset_args`, an array with the flags every writer should accept: `--components N --samples N --t0 SECS --interval SECS --job-len N --batch N --rate RECS_PER_SEC`. `--batch` is the number of node records the writer commits or sends together; the core times each batch, so it is the unit of ingest latency. Your writer must produce records that match the value rules in `core/dataset.py` exactly — the query engine verifies every answer against them.
+The `plugin_write` hook receives `dataset_args`, an array with the flags the ingest engine accepts: `--components N --samples N --t0 SECS --interval SECS --job-len N --batch N --rate RECS_PER_SEC --output FILE`; `--output` is where the engine saves the raw result. `--batch` is the number of node records the writer commits or sends together; the core times each batch, so it is the unit of ingest latency. The engine generates the records from `core/dataset.py` (or `core/dataset.c`), so they match the value rules exactly — the query engine verifies every answer against them.
 
 The `plugin_write` arguments in order: `$1` = WRITER (the writer name), `$2` = MODE (`full` or `live`), `$3` = INDEX (the partition index, 0-based), `$4` = SERVER\_ID. The plugin constructs its own storage target name using `ds_name()` (see "Plugin meta files" below) — the core does not pass a target. MODE is only relevant if the backend distinguishes between a full write and a live (streaming) write. In `live` mode, `dataset_args` includes a positive `--rate` so the writer throttles its output; in `full` mode, `--rate 0` means unthrottled.
 
-The writer's summary line is a single JSON object on stdout. It carries **raw inputs only**: counts, phase timers and progress checkpoints. A writer computes no rate, no percentile and no total time; `core/stats.py` derives all of them, the same way for every backend. For example:
+### The ingest adapter: `writer/<n>_write.py`
+
+The ingest engine (`core/ingest.py`) owns everything that is measured: it generates the records, drives the loop, batches, throttles, reads the clock and writes the raw result file. The plugin only runs it:
+
+```bash
+"${PYTHON}" "${BENCH_DIR}/core/ingest.py" --backend <n> --adapter <name> \
+    --writer "$writer" <adapter options> --node-index "$index" "${dataset_args[@]}"
+```
+
+The adapter is a Python module (the file name ends in `_write.py`) that defines one or more subclasses of `IngestAdapter` from `core/ingest_adapter.py`, plus two module-level attributes, the same way a query adapter does:
+
+```python
+ADAPTERS = {"<adapter-name>": AdapterClass, ...}
+DEFAULT_ADAPTER = "<adapter-name>"
+```
+
+| Method | Required | Purpose |
+| --- | --- | --- |
+| `add_arguments(parser)` | No | Static. Add the adapter's own options (host, path, token, ...) to the command line |
+| `open()` | Yes | One-time setup: connect, open or create the container, add schemas. Raise `BackendError` if the backend cannot be used |
+| `write(comp, seq, values, lists)` | Yes | Store one node record (`values`, from `Dataset.expected()`) and its list-attribute entries (`lists`, from `Dataset.expected_lists()`; empty without list attributes). It may buffer. Raise to report the sample as failed |
+| `commit()` | Yes | Complete everything written since the last commit and return once the backend has acknowledged it. Called at the end of every batch and at the end |
+| `sync()` | No | Make the data durable and visible to readers; a no-op if the backend has no such step |
+| `close()` | No | Teardown only. Nothing needed for completeness may be left to `close()` |
+| `info()` | No | Extra fields for the raw result (`target`, storage kind, ...) |
+
+The class also declares `durability`, a few words saying what `sync()` guarantees. The engine times four phases — `open`, `write` (first `write()` until the last `commit()` returns, record generation included), `sync` and `close` — so an adapter implements no timing, checkpoints or result format. The same rules fit any storage technology: connect and discover in `open`; `commit` is the acknowledgement barrier; `sync` covers durability and visibility lag; `close` is teardown.
+
+A C adapter does the same through `core/ingest.h`: it fills in a `struct ingest_adapter` of callbacks and calls `ingest_run()`; `backends/sos/writer/sos_write.c` is the worked example. Both engines have an adapter that stores nothing, to measure the harness itself: `--adapter null` for `core/ingest.py`, and `core/ingest_null.c` (`make -C core ingest_null`) for the C engine. Their `write_s` is the floor under every backend's `write_s` on the same engine; `OUTPUT.md`, "Measuring the harness floor", shows how to run them and subtract.
+
+The engine saves one raw JSON file per host, `results/ingest-<writer>-<host>-raw.json` (the path comes from `--output`). It carries **raw inputs only**: counts, phase timers and progress checkpoints; `core/stats.py` derives every rate and percentile, the same way for every backend. For example:
 
 ```json
-{"writer": "influx", "measurement": "monitoring", "backend": "influxdb/python", "node_index": 0, "records": 80000, "list_entries": 0, "errors": 0, "batch": 500, "rate": 0, "start_epoch_s": 1767225600.123456, "write_s": 7.73, "close_sync_s": 0.0, "checkpoints": [[0, 0], [0.048, 500], [0.097, 1000], ..., [7.73, 80000]]}
+{"writer": "influx", "backend": "influxdb/python", "adapter": "influx", "durability": "none (server acknowledges the write)", "node_index": 0, "records": 80000, "list_entries": 0, "errors": 0, "batch": 500, "rate": 0.0, "start_epoch_s": 1767225600.123456, "open_s": 0.002, "write_s": 7.73, "sync_s": 0.0, "close_s": 0.001, "measurement": "monitoring", "checkpoints": [[0.0, 0], [0.048, 500], [0.097, 1000], ..., [7.73, 80000]]}
 ```
 
 | Field | Meaning |
 | --- | --- |
-| `records` | Node records written (list-attribute entries are counted separately) |
+| `records` | Node records written successfully (list-attribute entries are counted separately) |
 | `list_entries` | List-attribute entries written; 0 for a dataset without list attributes |
-| `errors` | Writes that failed |
-| `batch`, `rate` | The `--batch` and `--rate` the writer ran with, echoed |
-| `start_epoch_s` | Wall-clock time (Unix seconds) at which the write began; lets the core place the hosts' writes on one time line |
-| `open_s` | Time to open the container or connection, if the backend has such a step (optional) |
-| `write_s` | First record inserted until the last record committed |
-| `close_sync_s` | Close and flush to stable storage; `0` if the backend has no such step |
-| `checkpoints` | `[[seconds since the write began, records written so far], ...]`, starting with `[0, 0]`. Add one entry after every batch has been committed or its request acknowledged, and a final one when the write finishes |
+| `errors` | Samples whose `write()` raised |
+| `batch`, `rate` | The `--batch` and `--rate` the run used, echoed |
+| `start_epoch_s` | Wall-clock time (Unix seconds) at which the write phase began; lets the core place the hosts' writes on one time line |
+| `open_s` | One-time setup |
+| `write_s` | First record until the last commit returned |
+| `sync_s` | Making the data durable and visible; `0` if the backend has no such step |
+| `close_s` | Teardown; reported, part of no rate |
+| `durability` | What `sync_s` guarantees, declared by the adapter |
+| `checkpoints` | `[[seconds since the write began, samples done so far], ...]`, starting with `[0, 0]`, one entry after every batch's commit and a final one when the write finishes |
 
-The core turns each interval between two checkpoints into one sample (its duration is the batch's latency; records divided by duration is its throughput) and reports the same summary for every backend: `n`, `min`, `p50`, `p90`, `p95`, `p99`, `max`, `mean`, `stddev`. Nothing assumes a data set size, a batch size or a host count. A trailing batch smaller than `--batch` is left out of the distributions but kept in the totals, and a percentile is reported only when there are enough batches for it (20 for p95, 100 for p99). See `OUTPUT.md`, "Statistics".
-
-The harness saves the line to `results/ingest-<writer>-<host>-raw.json`.
+The core turns each interval between two checkpoints into one sample (its duration is the batch's latency; records divided by duration is its throughput) and reports the same summary for every backend: `n`, `min`, `p50`, `p90`, `p95`, `p99`, `max`, `mean`, `stddev`. Nothing assumes a data set size, a batch size or a host count. A trailing batch smaller than `--batch` is left out of the distributions (it is still part of the totals).
 
 ### Plugin meta files
 
@@ -212,8 +242,8 @@ files. See `OUTPUT.md` for the full specification of each file's structure.
 | File pattern | Written by | Contents |
 | --- | --- | --- |
 | `ingest-<writer>-<host>-raw.json` | each writer | The writer's raw output for that host (counts, timers, checkpoints) |
-| `benchmark-<writer>-<adapter>.json` | `core/bench.py` | Combined benchmark result (write + query stats) |
-| `benchmark-live-<writer>.json` | `core/bench.py` | Live-poll benchmark result |
+| `benchmark-<writer>-<adapter>.json` | `core/egress.py` | Combined benchmark result (write + query stats) |
+| `benchmark-live-<writer>.json` | `core/egress.py` | Live-poll benchmark result |
 
 #### `logs/` — all logs
 
@@ -224,7 +254,7 @@ identify the source (phase, writer, hostname, adapter).
 | --- | --- | --- |
 | `<phase>-<host>.log` | `run.sh` | Step log (stdout/stderr of a remote step) |
 | `<daemon>-<host>.log` | plugin | Daemon log (output from a background service) |
-| `benchmark-<writer>-<adapter>.log` | `core/bench.py` | Everything printed to stdout during the benchmark |
+| `benchmark-<writer>-<adapter>.log` | `core/egress.py` | Everything printed to stdout during the benchmark |
 
 Step log examples: `build-server-01.log`, `write-c-server-01.log`,
 `serve-write-server-01.log`. Daemon log examples: `dsosd-server-01.log`,
@@ -282,7 +312,7 @@ Separately, `bin/run.sh` itself now always prints the outer `env VAR=val ... bas
 
 ### The query adapter: `query/<n>_query.py`
 
-A Python module that defines one or more subclasses of `Adapter` from `core/adapter.py`, plus two module-level attributes:
+A Python module that defines one or more subclasses of `EgressAdapter` from `core/egress_adapter.py`, plus two module-level attributes:
 
 ```python
 ADAPTERS = {"<adapter-name>": AdapterClass, ...}
@@ -313,7 +343,7 @@ Each adapter subclass must implement these methods:
 | `query(text)` | Yes | Run one query and yield its result in batches |
 | `count(batch)` | Yes | Return the number of rows in a batch. Default: `len(batch)` |
 | `records(batch)` | No | Return `(columns, rows)` where rows are dicts keyed by attribute name. Used for verification only |
-| `postprocess(text, columns, rows)` | No | Optional. Backend-specific shaping of a query's full, assembled result (after `records()` and column-map reversal), for verification only. Default: no-op (`return rows`). See `core/adapter.py`'s docstring and `backends/sos/query/sos_query.py` for a concrete use: collapsing a list-attribute query's possible multiple rows per node sample into one, since the SOS/DSOS query language has no JOIN/DISTINCT to do it in the query text itself |
+| `postprocess(text, columns, rows)` | No | Optional. Backend-specific shaping of a query's full, assembled result (after `records()` and column-map reversal), for verification only. Default: no-op (`return rows`). See `core/egress_adapter.py`'s docstring and `backends/sos/query/sos_query.py` for a concrete use: collapsing a list-attribute query's possible multiple rows per node sample into one, since the SOS/DSOS query language has no JOIN/DISTINCT to do it in the query text itself |
 | `close()` | No | Release the connection |
 
 The engine times each run from the call to `query()` until the last batch has been counted. Do only what a normal client of the backend would do inside `query()`, so timings stay comparable.
@@ -352,7 +382,7 @@ The engine resolves which attributes are affected using the dataset definition's
 Example from the InfluxDB adapter:
 
 ```python
-class InfluxPythonAdapter(Adapter):
+class InfluxPythonAdapter(EgressAdapter):
     name = "influxdb"
     dialect = None
     type_overrides = {
@@ -370,7 +400,7 @@ Test incrementally by running phases individually with the SSH launcher. The `bi
 # 1. Start the service (if PLUGIN_SERVICE=1)
 bin/run.sh -c bench-mydb.conf -l ssh serve-write
 
-# 2. Write the data and confirm the writer's JSON summary
+# 2. Write the data and confirm the ingest summary
 bin/run.sh -c bench-mydb.conf -l ssh write
 
 # 3. Run queries without verification to confirm connectivity
@@ -444,7 +474,7 @@ fields) or a bare scalar type spec (just `{"type": ..., ...}`, with no
 `name` of its own) — see `dataset/curated_metrics_like.json` for a worked
 example (`cpu`, `netdev`) and "List attributes" below for the full
 declaration format and generation algorithm. This is generated and verified
-generically by `core/dataset.py`/`core/valuegen.py` and `core/bench.py`
+generically by `core/dataset.py`/`core/valuegen.py` and `core/egress.py`
 with no code change needed per dataset; whether a *backend* can write and
 natively query a given dataset's list attributes is a separate, per-backend
 question (see "Writing a new backend" above and `STATUS.md` for which
@@ -474,11 +504,11 @@ inputs and fails loudly on any divergence.
 
 No per-dataset code is needed: any dataset JSON under `dataset/` is
 generated and verified by the same `core/valuegen.py` and
-`core/dataset.py`/`core/dataset.c`. Every Python writer and `core/bench.py`
-itself call `Dataset.expected()`/`Dataset.expected_lists()` directly, so
-they pick up a new dataset automatically; `backends/sos/writer/sos_write.c`
-likewise calls into `core/dataset.c`/`core/valuegen.c` rather than
-reimplementing anything.
+`core/dataset.py`/`core/dataset.c`. The Python ingest engine `core/ingest.py`
+and `core/egress.py` call `Dataset.expected()`/`Dataset.expected_lists()`
+directly, and the C engine `core/ingest.c` calls into
+`core/dataset.c`/`core/valuegen.c`, so they pick up a new dataset
+automatically; no ingest adapter reimplements any of it.
 
 #### Vocabulary
 
@@ -935,7 +965,7 @@ real sampler's output.
 record and `backends/<name>/README.md` for each backend's own mapping
 details): InfluxDB, SOS and DSOS all write list-attribute entries and
 answer `name[i]...`/`name[*]...` as native queries (SOS/DSOS via a plain
-select on the per-list schema plus `Adapter.postprocess()`-based dedup for
+select on the per-list schema plus `EgressAdapter.postprocess()`-based dedup for
 the existential form, since the SOS query language has no
 JOIN/DISTINCT). `count(name)` is native only on InfluxDB; SOS/DSOS have
 no `GROUP BY`/`HAVING`-style count filter, so that condition form reports
@@ -1060,7 +1090,7 @@ InfluxDB with a SQL join back to the node measurement on
 `(component_id, timestamp)`; SOS/DSOS (whose query language has no JOIN) by
 selecting straight from the per-list-attribute schema, with the existential
 `name[*].attr` form's possible multiple-rows-per-sample collapsed by the
-query engine's `Adapter.postprocess()` hook (`core/adapter.py`) rather than
+query engine's `EgressAdapter.postprocess()` hook (`core/egress_adapter.py`) rather than
 in the query text — see `queries/curated_metrics.json` for worked examples
 against `dataset/curated_metrics_like.json`, each with `"influxdb"` and
 `"dsos"` query strings. `count(name)` is native only on InfluxDB: SOS's

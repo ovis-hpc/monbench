@@ -30,7 +30,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from adapter import Adapter, BackendError
+from egress_adapter import EgressAdapter, BackendError
 
 _PROBE_SQL      = "SELECT COUNT(*) AS n FROM {measurement}"
 _PROBE_INFLUXQL = "SELECT COUNT(seq) FROM {measurement} LIMIT 1"
@@ -80,7 +80,7 @@ def _row_to_dict(row):
 
 # ------------------------------------------------------------------ HTTP adapter
 
-class InfluxHttpAdapter(Adapter):
+class InfluxHttpAdapter(EgressAdapter):
     """Query InfluxDB 3 via the HTTP query API (no client library needed)."""
 
     name = "influxdb-http"
@@ -152,7 +152,7 @@ class InfluxHttpAdapter(Adapter):
 
 # ------------------------------------------------------------------ Python (Flight) adapter
 
-class InfluxPythonAdapter(Adapter):
+class InfluxPythonAdapter(EgressAdapter):
     """Query InfluxDB 3 via the influxdb_client_3 library (Arrow Flight)."""
 
     name = "influxdb"

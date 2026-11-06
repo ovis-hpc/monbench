@@ -17,11 +17,11 @@ After a run, `OUTPUT_DIR/<pair>/` contains:
 | `meta/` | `ingest-handoff-<writer>.json` | plugin (`plugin_write`) | Where the writer stored data (writer→query handoff) |
 | `meta/` | `dataset-<writer>.json` | `core/dataset.py` | Dataset parameters and writer identity for verification |
 | `results/` | `ingest-<writer>-<host>-raw.json` | each writer | One JSON object per writer run on that host |
-| `results/` | `benchmark-<writer>-<adapter>.json` | `core/bench.py` | Combined benchmark result (see structure below) |
-| `results/` | `benchmark-live-<writer>.json` | `core/bench.py` | Live-poll result (see structure below) |
-| `results/` | `egress-<adapter>-raw.json` | `core/bench.py` | Per-run raw query timings for downstream analysis (see below) |
+| `results/` | `benchmark-<writer>-<adapter>.json` | `core/egress.py` | Combined benchmark result (see structure below) |
+| `results/` | `benchmark-live-<writer>.json` | `core/egress.py` | Live-poll result (see structure below) |
+| `results/` | `egress-<adapter>-raw.json` | `core/egress.py` | Per-run raw query timings for downstream analysis (see below) |
 | `logs/` | `<phase>-<host>.log` | the harness | Full stdout/stderr of every remote step |
-| `logs/` | `benchmark-<writer>-<adapter>.log` | `core/bench.py` | Everything printed to stdout during the benchmark |
+| `logs/` | `benchmark-<writer>-<adapter>.log` | `core/egress.py` | Everything printed to stdout during the benchmark |
 
 
 ## Benchmark result JSON
@@ -66,7 +66,7 @@ The data set parameters used for this run.
 `true` when `DRY_RUN` was set for this `check`/`query` run (`bin/run.sh -d`,
 forwarded as `DRY_RUN=1` — see `README.md`, "Dry run"). When `true`, every
 entry in `query.results` has status `DRY`: each query's final text was
-resolved and is reported, but `core/bench.py` never called
+resolved and is reported, but `core/egress.py` never called
 `adapter.connect()`, and never called `adapter.query()`/`count()`/`records()`
 for any query. `ingest` is unaffected by this field — it reflects whatever
 the most recent real `write` produced; a dry `query`/`check` run does not
@@ -95,6 +95,8 @@ computed in the core so that every backend is summarized the same way.
       "open_s":                0.01,
       "write_s":               1.23,
       "sync_s":                0.45,
+      "close_s":               0.02,
+      "durability":            "sos_container_commit(SOS_COMMIT_SYNC)",
       "records_per_s":         65040,
       "durable_records_per_s": 47619,
       "window_records":        100,
@@ -128,11 +130,13 @@ computed in the core so that every backend is summarized the same way.
 | `records` | node-level records written |
 | `list_entries` | list-attribute entries written (0 without list attributes) |
 | `errors` | failed writes |
-| `batch` | the writer's batch size setting |
-| `rate` | the writer's rate setting |
-| `open_s` | container/connection open time |
-| `write_s` | first record inserted → last record committed |
-| `sync_s` | close and flush to stable storage (0 if there is none) |
+| `batch` | the batch size setting |
+| `rate` | the rate setting |
+| `open_s` | one-time setup: connect, open the container, schemas |
+| `write_s` | first record → last commit returned (generation included) |
+| `sync_s` | making the data durable and visible (0 if there is no such step) |
+| `close_s` | teardown; part of no rate |
+| `durability` | what `sync_s` guarantees for this backend, declared by the adapter |
 | `records_per_s` | `records / write_s` |
 | `durable_records_per_s` | `records / (write_s + sync_s)` |
 | `window_records` | records per batch window (`batch`, or `records` if batch is 0) |
@@ -325,35 +329,93 @@ Under `DRY_RUN`, `live` reports a single `"live poll"` entry with status
 
 ## What is timed
 
-### Write side — self-timed on the server
+### Write side — core-timed on the server
 
-Each writer is a standalone program (C binary or Python script) that runs
-on a server host via ssh or srun. The core harness cannot directly time a
-remote process, so each writer measures and reports its own timing.
+The ingest engine (`core/ingest.py`, or `core/ingest.c` linked into a C
+adapter) runs on each server host via ssh or srun. It owns the clock, the
+write loop, batching and throttling, and writes the raw result file
+`results/ingest-<writer>-<host>-raw.json` itself; the backend's ingest
+adapter only calls its storage API. Every backend is therefore timed by the
+same code, the way queries are timed by `core/egress.py`.
 
-The writer's JSON output includes:
+The engine times four phases, in this order:
 
 | Field | What it covers |
 |---|---|
-| `write_s` | first record inserted → last record committed (the data ingestion itself) |
-| `close_sync_s` | container close and `os.sync()` (flushing data to stable storage) |
-| `total_s` | container open → sync complete (the full operation) |
-| `records_per_s` | `records / total_s` excluding the open step |
+| `open_s` | one-time setup: connect, open or create the container, add schemas |
+| `write_s` | first record → the last `commit()` returns (record generation is included) |
+| `sync_s` | `adapter.sync()`: making the data durable and visible to readers (`0` if the backend has no such step) |
+| `close_s` | teardown only; reported, but part of no rate |
 
-The exact boundaries differ slightly between writers (the SOS C writer
-includes `sos_container_commit()` in `write_s`; the InfluxDB writer has
-no sync step), but each writer's JSON is self-documenting: only the fields
-it actually measures are present.
+An adapter's `commit()` returns only after the backend has acknowledged the
+batch, and nothing needed for completeness is left to `close()`. The raw file
+also holds a `durability` string, declared by the adapter, saying what
+`sync_s` guarantees for that backend (for example `os.sync()` for the SOS
+Python adapter), so the durable figures can be read for what they are.
 
-Additionally, each writer reports a list of checkpoints: `[[seconds, records], ...]`,
+The summary derives `records_per_s = records / write_s` and
+`durable_records_per_s = records / (write_s + sync_s)`.
+
+Additionally, the raw file holds a list of checkpoints: `[[seconds, samples], ...]`,
 one entry at the end of every batch (after its commit completed) and a
 final entry when the write finished. `core/stats.py` uses these to compute
 per-batch-window latency and throughput distributions (see the ingest
 section above).
 
+#### Measuring the harness floor
+
+A backend's `write_s` includes work that is not the backend's: the engine
+generates every record inside the write phase and runs the loop. The null
+adapter stores nothing, so its `write_s` is that work alone, the floor under
+every backend's `write_s`. There is one null adapter per engine, and a
+backend is compared with the engine it runs on, because the two engines
+generate at very different speeds (Python about 130-200 µs per record, C a
+few µs).
+
+Run the null adapter on the same host, with the same data set, `--components`,
+`--samples` and `--batch` as the run being explained, and unthrottled
+(`--rate 0`):
+
+```bash
+# Python engine (the floor for sos_write.py, dsos_write.py, influx_write.py)
+DATASET=dataset/default.json python3 core/ingest.py --backend null --adapter null \
+    --writer null --output /tmp/floor-py.json --node-index 0 \
+    --components 16 --samples 5000 --batch 500
+
+# C engine (the floor for sos_write)
+make -C core ingest_null
+DATASET=dataset/default.json core/ingest_null \
+    --writer null --output /tmp/floor-c.json --node-index 0 \
+    --components 16 --samples 5000 --batch 500
+```
+
+Then, from each raw file:
+
+| Quantity | Calculation |
+|---|---|
+| Floor rate | `records / write_s` of the null run |
+| Storage time of a backend run | `write_s` of the backend run − `write_s` of the null run on the same engine |
+| Share of the backend's `write_s` that is harness | `write_s` (null) / `write_s` (backend) |
+| Storage-only rate | `records / (write_s (backend) − write_s (null))` |
+
+Notes on reading the result:
+- Generation is deterministic, so the null run costs the same every time;
+  repeat it and take the median, since it still varies with the host's load.
+- The subtraction is an estimate. It leaves in what the adapter itself does to
+  turn a record into the backend's format (for example building line
+  protocol), which is the adapter's cost and belongs to the backend.
+- Never compare a Python adapter's `write_s` with the C null run, or the
+  reverse.
+- This is a stopgap for measuring generation: a later change will time
+  generation separately inside the engine and report it directly.
+
+`QUERY_ADAPTER=null` does the same for egress in `query` mode: it returns no
+rows, so it measures only the timing loop (`check` mode fails with it, as
+there is no data).
+
 ### Query side — core-timed on the client
 
-Query timing is done by the benchmark engine (`core/bench.py`), not by
+Query timing is done by the benchmark engine (`core/egress.py`), not by
 the adapter. The function `timed_run()` brackets the measurement:
 
 ```python

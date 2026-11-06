@@ -88,7 +88,7 @@ plugin_write() { # WRITER MODE INDEX SERVER_ID
 	# Update the dsosd directory file so it knows about this target.
 	write_directory "$id"
 	session="$(write_session_file)"
-	local args=(--session "$session" --target "$target"
+	local args=(--writer "$writer" --session "$session" --target "$target"
 		--template "$template" --node-index "$index"
 		"${dataset_args[@]}")
 	log "writing ${target} (dsos writer, through dsosd on ${HOST}) to ${path}"
@@ -96,7 +96,8 @@ plugin_write() { # WRITER MODE INDEX SERVER_ID
 	_dsos_write_meta "$writer" "$target" "$id"
 	case "$writer" in
 	dsos)
-		run_logged DATASET="${DATASET}" -- "${PYTHON}" "${DSOS_DIR}/writer/dsos_write.py" "${args[@]}"
+		run_logged DATASET="${DATASET}" -- "${PYTHON}" "${BENCH_DIR}/core/ingest.py" \
+			--backend dsos --adapter dsos "${args[@]}"
 		;;
 	*)
 		die "the dsos backend has no writer '$writer' (available: dsos)"

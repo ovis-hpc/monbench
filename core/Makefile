@@ -31,5 +31,10 @@ dataset_cross_check: dataset_cross_check.c dataset.c valuegen.c dataset.h valueg
 	$(CC) $(CFLAGS) -I. -o $@ \
 		dataset_cross_check.c dataset.c valuegen.c $(JANSSON_SO)
 
+# The C ingest engine with an adapter that stores nothing: measures the
+# engine itself. Run as: DATASET=... ./ingest_null --writer null --output F --node-index 0
+ingest_null: ingest_null.c ingest.c ingest.h dataset.c valuegen.c dataset.h valuegen.h
+	$(CC) $(CFLAGS) -I. -o $@ ingest_null.c ingest.c dataset.c valuegen.c $(JANSSON_SO) -lm
+
 clean:
-	rm -f valuegen_cross_check dataset_cross_check
+	rm -f valuegen_cross_check dataset_cross_check ingest_null

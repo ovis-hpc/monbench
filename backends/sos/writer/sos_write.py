@@ -1,12 +1,10 @@
-#!/usr/bin/env python3
-"""sos_write.py -- write the benchmark data set with the SOS Python bindings.
+"""sos_write.py -- ingest adapter that writes the benchmark data set with the
+SOS Python bindings.
 
-Produces the data set defined by the DATASET env var (see
-core/dataset.py), the same records as sos_write.c, so that containers
-written by either writer answer every query identically. The value rules
-themselves are not duplicated here: this writer imports core/dataset.py
-and calls Dataset.expected() for every record, so it can never drift from
-the Python reference.
+Loaded by core/ingest.py, which generates the records (core/dataset.py, the
+same values sos_write.c writes), drives the loop and does all the timing; this
+adapter only calls the SOS API. Containers written by either writer answer
+every query identically.
 
 If the dataset declares list attributes (design/value-generation.md Sec
 6), each one's entry instances are also written, one schema per list
@@ -21,38 +19,16 @@ integer attribute the template created for it -- nothing is dropped. A
 dataset with no list attributes (e.g. dataset/default.json) writes
 exactly as before.
 """
-import argparse
 import json
 import os
 import sys
-import time
-
-from sosdb import Sos
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  "..", "..", "..", "core"))
-from dataset import Dataset              # noqa: E402
+from ingest_adapter import BackendError, IngestAdapter   # noqa: E402
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--path", required=True)
-    p.add_argument("--template", required=True)
-    p.add_argument("--node-index", type=int, required=True)
-    p.add_argument("--components", type=int, default=16)
-    p.add_argument("--samples", type=int, default=5000)
-    p.add_argument("--t0", type=int, default=1700000000)
-    p.add_argument("--interval", type=int, default=1)
-    p.add_argument("--job-len", type=int, default=500)
-    p.add_argument("--batch", type=int, default=500,
-                   help="node records committed together")
-    p.add_argument("--rate", type=float, default=0.0,
-                   help="records per second, 0 = unthrottled")
-    p.add_argument("--storage", choices=["mmos", "lsos"], default="mmos")
-    return p.parse_args()
-
-
-def open_container(path, backend):
+def open_container(Sos, path, backend):
     be = Sos.BE_LSOS if backend == "lsos" else Sos.BE_MMOS
     cont = Sos.Container()
     if not os.path.exists(path):
@@ -61,7 +37,7 @@ def open_container(path, backend):
     return cont
 
 
-def get_schema(cont, template):
+def get_schema(Sos, cont, template):
     schema = cont.schema_by_name(template["name"])
     if schema is None:
         schema = Sos.Schema()
@@ -80,8 +56,8 @@ class ListWriter:
     make_schema.py's sos_attr()). For a bare-scalar-entries list,
     there is a single "value" column instead (make_schema.py's
     convert_list())."""
-    def __init__(self, cont, template, ds, name):
-        self.schema = get_schema(cont, template)
+    def __init__(self, Sos, cont, template, ds, name):
+        self.schema = get_schema(Sos, cont, template)
         self.attr_ids = {n: self.schema.attr_by_name(n).attr_id()
                          for n in ("timestamp", "component_id", "job_id",
                                    "seq", "entry_index")}
@@ -122,101 +98,78 @@ class ListWriter:
         return rc
 
 
-def main():
-    a = parse_args()
-    with open(a.template) as f:
-        template = json.load(f)
+class SosIngest(IngestAdapter):
+    name = "py"
+    # The bindings do not export SOS_COMMIT_SYNC, so sync() flushes the
+    # written pages of the whole host with os.sync().
+    durability = "os.sync()"
 
-    # Attribute list and types come from the dataset definition, not the
-    # SOS schema template -- see backends/sos/README.md's "Write methods".
-    ds = Dataset(Dataset.load_definition(os.environ["DATASET"]),
-                partitions=1, component_ids=a.components, samples=a.samples,
-                t0=a.t0, interval=a.interval, job_len=a.job_len)
+    @staticmethod
+    def add_arguments(p):
+        p.add_argument("--path", required=True, help="container path")
+        p.add_argument("--template", required=True, help="SOS schema template JSON file")
+        p.add_argument("--storage", choices=["mmos", "lsos"], default="mmos")
 
-    t_start = time.monotonic()
-    cont = open_container(a.path, a.storage)
-    schema = get_schema(cont, template["node"])
-    attr_ids = {n: schema.attr_by_name(n).attr_id() for n in ds.attr_names}
-    list_writers = {name: ListWriter(cont, template["lists"][name], ds, name)
-                    for name in template["lists"]}
+    def open(self):
+        try:
+            from sosdb import Sos
+        except ImportError as e:
+            raise BackendError(f"the sosdb module is not available: {e}")
+        a, ds = self.ctx.args, self.ctx.dataset
+        with open(a.template) as f:
+            template = json.load(f)
+        self.cont = open_container(Sos, a.path, a.storage)
+        self.schema = get_schema(Sos, self.cont, template["node"])
+        self.attr_ids = {n: self.schema.attr_by_name(n).attr_id() for n in ds.attr_names}
+        self.attr_types = {n: ds.attr_type(n) for n in ds.attr_names}
+        self.list_writers = {name: ListWriter(Sos, self.cont, template["lists"][name], ds, name)
+                             for name in template["lists"]}
+        self.ds = ds
+        self.in_txn = False
 
-    base = (a.node_index + 1) * 1000
-    written = errors = in_batch = list_entries = 0
-    checkpoints = [[0, 0]]
-    start_epoch = time.time()
-    t_write = time.monotonic()
-
-    cont.begin()
-    for seq in range(a.samples):
-        for c in range(a.components):
-            comp = base + c
-            values = ds.expected(comp, seq)
-            obj = schema.alloc()
-            for name in ds.attr_names:
-                aid = attr_ids[name]
-                v = values[name]
-                if name == "timestamp":
-                    obj[aid] = (int(v), 0)
-                elif ds.attr_type(name) == "double":
-                    obj[aid] = float(v)
-                elif ds.attr_type(name) == "string":
-                    obj[aid] = str(v)
-                else:
-                    obj[aid] = int(v)
-            rc = obj.index_add()
-            obj.release()
+    def write(self, comp, seq, values, lists):
+        if not self.in_txn:
+            self.cont.begin()
+            self.in_txn = True
+        obj = self.schema.alloc()
+        for name, aid in self.attr_ids.items():
+            v = values[name]
+            if name == "timestamp":
+                obj[aid] = (int(v), 0)
+            elif self.attr_types[name] == "double":
+                obj[aid] = float(v)
+            elif self.attr_types[name] == "string":
+                obj[aid] = str(v)
+            else:
+                obj[aid] = int(v)
+        rc = obj.index_add()
+        obj.release()
+        failed = [f"node record: error {rc}"] if rc else []
+        for rec in lists:
+            rc = self.list_writers[rec["list"]].write(
+                comp, values["job_id"], seq, values["timestamp"],
+                rec, self.ds, rec["list"])
             if rc:
-                errors += 1
-                if errors <= 10:
-                    print(f"error {rc} indexing record {written}", file=sys.stderr)
-            written += 1
-            for rec in ds.expected_lists(comp, seq):
-                rc = list_writers[rec["list"]].write(
-                    comp, values["job_id"], seq, values["timestamp"],
-                    rec, ds, rec["list"])
-                if not rc:
-                    list_entries += 1
-                if rc:
-                    errors += 1
-                    if errors <= 10:
-                        print(f"error {rc} indexing {rec['list']}[{rec['index']}] "
-                              f"for record {written}", file=sys.stderr)
-            in_batch += 1
-            if in_batch == a.batch:
-                cont.commit()
-                cont.end()
-                checkpoints.append([round(time.monotonic() - t_write, 6), written])
-                in_batch = 0
-                cont.begin()
-            if a.rate > 0:
-                wait = t_write + written / a.rate - time.monotonic()
-                if wait > 0:
-                    time.sleep(wait)
-    cont.commit()
-    cont.end()
-    t_indexed = time.monotonic()
-    if checkpoints[-1][1] != written:
-        checkpoints.append([round(t_indexed - t_write, 6), written])
-    # The bindings do not export SOS_COMMIT_SYNC, so close() is asynchronous;
-    # os.sync() flushes the written pages so the timing is comparable with
-    # the C writer's synchronous close.
-    cont.close()
-    os.sync()
-    t_end = time.monotonic()
+                failed.append(f"{rec['list']}[{rec['index']}]: error {rc}")
+        if failed:
+            raise BackendError("; ".join(failed))
 
-    print(json.dumps({
-        "writer": "py", "container": a.path, "backend": a.storage,
-        "node_index": a.node_index, "records": written, "errors": errors,
-        "list_entries": list_entries,
-        "batch": a.batch, "rate": a.rate,
-        "start_epoch_s": round(start_epoch, 6),
-        "open_s": round(t_write - t_start, 3),
-        "write_s": round(t_indexed - t_write, 3),
-        "close_sync_s": round(t_end - t_indexed, 3),
-        "checkpoints": checkpoints,
-    }))
-    return 1 if errors else 0
+    def commit(self):
+        if self.in_txn:
+            self.cont.commit()
+            self.cont.end()
+            self.in_txn = False
+
+    def sync(self):
+        os.sync()
+
+    def close(self):
+        self.cont.close()
+
+    def info(self):
+        a = self.ctx.args
+        return {"container": a.path, "backend": a.storage}
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+ADAPTERS = {SosIngest.name: SosIngest}
+DEFAULT_ADAPTER = SosIngest.name

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bench.py -- benchmark and verify queries against one backend.
+"""egress.py -- benchmark and verify queries against one backend.
 
 Runs on the query node (normally through 'bin/node.sh check' or
 'bin/node.sh query'). Settings come from the environment exported by
@@ -7,17 +7,19 @@ node.sh from bench.conf and the backend's <name>_backend.conf.
 
 The engine is backend-neutral. It loads the query adapter from the backend
 plugin (backends/<BACKEND>/query/<BACKEND>_query.py), connects once, then for each query in
-the query set runs one or both of the following steps:
+the query set runs one or both of the following steps (QUERY_ADAPTER=null
+uses a built-in adapter that returns no rows, to measure the timing loop):
 
   check  Run the query once, untimed, and verify the full result against the
          data set (core/dataset.py).
   query  Run the query REPEAT times, timing each run from the start of the
          query until the last row has been fetched.
 
-Every statistic is computed here, in the core, by core/stats.py: adapters
-and writers only supply raw inputs (query results to be timed here; writer
-counts, phase timers and checkpoints). Ingest and query results are
-summarized the same way, so they are directly comparable.
+Every statistic is computed in the core, by core/stats.py: adapters only
+call their backend, and the engines do the timing (this one for queries,
+core/ingest.py for writes). Ingest and query results are summarized the same
+way, so they are directly comparable. The ingest results of the writer are
+loaded through core/ingest.py and included in the combined result file.
 
 The data set parameters come from the writer's metadata file, written when
 the data was written. If it names a different backend, the run stops.
@@ -48,7 +50,8 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import stats                                          # noqa: E402
-from adapter import BackendError                      # noqa: E402
+import ingest as ingest_engine                        # noqa: E402
+from egress_adapter import BackendError, EgressAdapter  # noqa: E402
 from dataset import Dataset, IDENTITY_ATTRS, read_meta  # noqa: E402
 
 # ----------------------------------------------------------------- settings
@@ -57,7 +60,7 @@ from dataset import Dataset, IDENTITY_ATTRS, read_meta  # noqa: E402
 def env(name, cast=str, default=None):
     value = os.environ.get(name, default)
     if value is None:
-        sys.exit(f"bench.py: {name} is not set; run through bin/node.sh")
+        sys.exit(f"egress.py: {name} is not set; run through bin/node.sh")
     return cast(value)
 
 
@@ -81,17 +84,32 @@ DRY_RUN = bool(os.environ.get("DRY_RUN"))
 DS = None          # the Dataset being checked; set in main()
 
 
+class NullEgress(EgressAdapter):
+    """Runs nothing and returns no rows: with 'query' mode it measures the
+    cost of the timing loop itself, the floor under every other backend's
+    figures. It has no data, so verification ('check') fails with it."""
+    name = "null"
+
+    def connect(self):
+        pass
+
+    def query(self, text):
+        return iter(())
+
+
 def load_plugin():
-    """Load backends/<BACKEND>/query/<BACKEND>_query.py and return (module, adapter class)."""
+    """Load backends/<BACKEND>/query/<BACKEND>_query.py and return the adapter class."""
+    if QUERY_ADAPTER == "null":
+        return NullEgress
     path = os.path.join(BENCH_DIR, "backends", BACKEND, "query", f"{BACKEND}_query.py")
     if not os.path.exists(path):
-        sys.exit(f"bench.py: backend '{BACKEND}' has no query adapter ({path})")
+        sys.exit(f"egress.py: backend '{BACKEND}' has no query adapter ({path})")
     spec = importlib.util.spec_from_file_location(f"backend_{BACKEND}", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     name = QUERY_ADAPTER or module.DEFAULT_ADAPTER
     if name not in module.ADAPTERS:
-        sys.exit(f"bench.py: backend '{BACKEND}' has no adapter '{name}'; "
+        sys.exit(f"egress.py: backend '{BACKEND}' has no adapter '{name}'; "
                  f"available: {', '.join(sorted(module.ADAPTERS))}")
     return module.ADAPTERS[name]
 
@@ -258,7 +276,7 @@ def fill(value, values, where):
         try:
             return value.format(**values)
         except KeyError as e:
-            sys.exit(f"bench.py: {where} uses unknown placeholder {e}; "
+            sys.exit(f"egress.py: {where} uses unknown placeholder {e}; "
                      f"available: {', '.join(sorted(values))}")
     if isinstance(value, dict):
         return {k: fill(v, values, where) for k, v in value.items()}
@@ -360,7 +378,7 @@ def load_query_set(path, adapter):
         doc = json.load(f)
     queries = doc.get("queries")
     if not isinstance(queries, list) or not queries:
-        sys.exit(f"bench.py: {path} has no 'queries' list")
+        sys.exit(f"egress.py: {path} has no 'queries' list")
     values = DS.placeholders(LIMIT_N,
                              _build_literal_formats(adapter.type_overrides))
     # A second set of placeholders without literal formats, used to expand
@@ -382,8 +400,10 @@ def load_query_set(path, adapter):
         text = q.get("query")
         if isinstance(text, dict):                       # per backend or dialect
             text = text.get(adapter.name, text.get(adapter.dialect))
+            if text is None and adapter.name == "null":
+                text = next(iter(q["query"].values()), None)
         if text is None and "query" not in q:
-            sys.exit(f"bench.py: {where} has no 'query'")
+            sys.exit(f"egress.py: {where} has no 'query'")
         # Rename columns before expanding placeholders.
         if text:
             text = _apply_column_map(text, col_map)
@@ -562,8 +582,8 @@ def collect(adapter, text):
     before calling this function.  Result columns are renamed back to
     dataset attribute names here so the verifier always sees dataset
     names. adapter.postprocess() then gets a chance to do any further,
-    backend-specific shaping of the full result (see Adapter.postprocess's
-    docstring in core/adapter.py) -- a no-op for most backends.
+    backend-specific shaping of the full result (see EgressAdapter.postprocess's
+    docstring in core/egress_adapter.py) -- a no-op for most backends.
     """
     columns, rows = [], []
     for batch in adapter.query(text):
@@ -682,88 +702,13 @@ def load_dataset(writer, live):
     if meta:
         wrote = meta["backend"]
         if PLUGIN_READS and wrote not in PLUGIN_READS:
-            sys.exit(f"bench.py: writer '{writer}' was written by backend "
+            sys.exit(f"egress.py: writer '{writer}' was written by backend "
                      f"'{wrote}', which query backend '{QUERY_BACKEND}' cannot "
                      f"read (it reads: {', '.join(PLUGIN_READS)})")
         DS = Dataset.from_meta(meta)
         return f"written by {wrote} ({meta['writer']} writer) at {meta['written_at']}"
     DS = Dataset.from_env(live=live)
     return "no metadata file; using the current settings" if not live else "live settings"
-
-
-def load_ingest_results(writer):
-    """Read the raw write results of WRITER and compute their statistics.
-
-    Each writer leaves one JSON line of raw inputs per server (see the
-    docstring of core/stats.py); every derived number -- rates, window
-    percentiles, wall time -- is computed here, by core/stats.py, the same
-    way for every backend.
-    """
-    import glob
-    pattern = os.path.join(OUTPUT_DIR, "results", f"ingest-{writer}-*-raw.json")
-    found = []                      # (host, raw dict) or (host, error text)
-    for f in sorted(glob.glob(pattern)):
-        host = os.path.basename(f).replace(f"ingest-{writer}-", "").replace("-raw.json", "")
-        try:
-            with open(f) as fh:
-                raw = json.load(fh)
-        except Exception:
-            found.append((host, f"could not read {f}"))
-            continue
-        if not all(isinstance(raw.get(k), (int, float)) for k in ("records", "write_s")):
-            found.append((host, f"{f} has no records/write_s"))
-            continue
-        found.append((host, raw))
-    raws = [r for _, r in found if isinstance(r, dict)]
-    summary, per_host = stats.ingest_summary(raws) if raws else ({}, [])
-    per_host = iter(per_host)
-    hosts = []
-    for host, raw in found:
-        if isinstance(raw, str):
-            hosts.append({"host": host, "error": raw})
-            continue
-        hosts.append({"host": host, "backend": WRITE_BACKEND,
-                      "writer": raw.get("writer", "-"),
-                      "storage": raw.get("backend", "-"), **next(per_host)})
-    return {"hosts": hosts, "summary": summary}
-
-
-def print_ingest_summary(ingest):
-    """Print the ingest results as a table."""
-    hosts = ingest.get("hosts", [])
-    if not hosts:
-        print("  (no ingest result files found)")
-        return
-    hw = max(len(h.get("host", "")) for h in hosts)
-    hw = max(hw, len("all hosts"))
-    print(f"  {'host':{hw}}  {'writer':>6}  {'records':>10}  {'write_s':>8}  {'sync_s':>7}"
-          f"  {'records/s':>10}  {'durable/s':>10}  {'win p50/s':>10}  {'win p95/s':>10}")
-    for h in hosts:
-        host = h.get("host", "?")
-        if "error" in h:
-            print(f"  {host:{hw}}  {h['error']}")
-            continue
-        thr = h["throughput_per_s"]
-        print(f"  {host:{hw}}  {h.get('writer','-'):>6}  {h['records']:>10d}"
-              f"  {h['write_s']:>8.2f}  {h['sync_s']:>7.2f}"
-              f"  {_num(h['records_per_s']):>10}  {_num(h['durable_records_per_s']):>10}"
-              f"  {_num(thr['p50']):>10}  {_num(thr['p95']):>10}")
-    sm = ingest.get("summary", {})
-    if not sm:
-        return
-    thr = sm["throughput_per_s"]
-    print(f"  {'all hosts':{hw}}  {'':>6}  {sm['total_records']:>10d}"
-          f"  {sm['write_wall_s']:>8.2f}  {sm['durable_wall_s'] - sm['write_wall_s']:>7.2f}"
-          f"  {_num(sm['records_per_s']):>10}  {_num(sm['durable_records_per_s']):>10}"
-          f"  {_num(thr['p50']):>10}  {_num(thr['p95']):>10}")
-    every = next((h["window_records"] for h in hosts if "error" not in h), None)
-    imbalance = sm["host_imbalance"]
-    imbalance = "-" if imbalance is None else f"{imbalance:.2f}x"
-    print(f"  windows: {thr['n']} of {every} records each, pooled over the hosts; "
-          f"a percentile shows '-' below {stats.min_samples(95)} windows (p95) "
-          f"or {stats.min_samples(99)} (p99)")
-    print(f"  all hosts: wall time on a {sm['wall_basis']} basis; "
-          f"fastest/slowest host {imbalance}")
 
 
 def run_checks(writer, query_file, mode="both"):
@@ -774,14 +719,14 @@ def run_checks(writer, query_file, mode="both"):
           f"(adapter '{adapter.name}'), writer '{writer}', target '{target}' "
           f"on {', '.join(SERVERS)}")
     print(f"Data set '{DS.name}': {DS.size()} records in {DS.partitions} partitions; {source}")
-    ingest = load_ingest_results(writer)
+    ingest = ingest_engine.load_results(OUTPUT_DIR, writer, WRITE_BACKEND)
     if DRY_RUN:
         print("\nDRY RUN: not connecting to the backend; queries below are resolved but not sent.")
     else:
         try:
             adapter.connect()
         except BackendError as e:
-            sys.exit(f"bench.py: backend '{BACKEND}' check failed: {e}")
+            sys.exit(f"egress.py: backend '{BACKEND}' check failed: {e}")
     queries = load_query_set(query_file, adapter)
 
     mode_desc = {"check": "verification only (no timing)",
@@ -801,16 +746,6 @@ def run_checks(writer, query_file, mode="both"):
     return rep
 
 
-def run_write_summary(writer):
-    """Load and print the ingest summary for a writer after writing."""
-    source = load_dataset(writer, live=False)
-    print(f"Data set '{DS.name}': {DS.size()} records in {DS.partitions} partitions; {source}")
-    ingest = load_ingest_results(writer)
-    print("\nIngest performance:")
-    print_ingest_summary(ingest)
-    return ingest
-
-
 def run_live(writer):
     """Poll a writer that is being written; each answer must be valid."""
     cls = load_plugin()
@@ -824,7 +759,7 @@ def run_live(writer):
     text = next((q["query"] for q in load_query_set(QUERY_FILE, cls)
                  if q["type"] == "all" and q["query"]), None)
     if not text:
-        sys.exit(f"bench.py: {QUERY_FILE} has no query of type 'all' for adapter '{cls.name}'")
+        sys.exit(f"egress.py: {QUERY_FILE} has no query of type 'all' for adapter '{cls.name}'")
     if DRY_RUN:
         print(f"DRY RUN: would poll writer '{writer}' (target '{target}') every "
               f"{LIVE_POLL}s until {final} rows with:")
@@ -873,12 +808,11 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--writer", required=True,
                    help="name of the writer whose data to check or benchmark")
-    p.add_argument("--mode", choices=("check", "query", "both", "write-summary"),
+    p.add_argument("--mode", choices=("check", "query", "both"),
                    default="both",
                    help="check = verify only (no timing); "
                         "query = time only (no verification); "
-                        "both = verify then time (default); "
-                        "write-summary = print ingest summary for a writer")
+                        "both = verify then time (default)")
     p.add_argument("--live", action="store_true")
     p.add_argument("--queries", default=QUERY_FILE,
                    help="query set file (default: QUERY_FILE, or queries/default.json)")
@@ -886,10 +820,6 @@ def main():
 
     results_dir = os.path.join(OUTPUT_DIR, "results")
     os.makedirs(results_dir, exist_ok=True)
-
-    if a.mode == "write-summary":
-        run_write_summary(a.writer)
-        return 0
 
     tmp_log = os.path.join(OUTPUT_DIR, "logs", f"benchmark-{a.writer}-pending.log")
     tee = Tee(tmp_log)

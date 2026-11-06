@@ -37,7 +37,13 @@ empty selects both):
 | `c py` (default) | both, into separate targets `monitoring_c` and `monitoring_py` | for comparison |
 
 The C writer is built by `bin/run.sh build`; the Python writer needs the
-`sosdb` module importable on the server nodes.
+`sosdb` module importable on the server nodes. Both are ingest adapters: the
+Python one is run by `core/ingest.py`, the C one links the C engine
+`core/ingest.c`, and the engine does the timing and saves the raw result.
+The two end differently: the C adapter's `sync()` is
+`sos_container_commit(SOS_COMMIT_SYNC)`, the Python adapter's is `os.sync()`
+(the bindings do not export `SOS_COMMIT_SYNC`); each declares this as its
+`durability`.
 
 Both writers (and `dsos_write.py`, which shares `sos_write.py`'s approach)
 treat the SOS schema template -- the JSON built by `make_schema.py` from

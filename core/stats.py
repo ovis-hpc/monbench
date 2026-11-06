@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """stats.py -- every statistic monbench reports is computed here.
 
-Backends supply raw inputs only: a writer reports counts, phase timers and
-a list of progress checkpoints; a query adapter just runs queries, and
-core/bench.py times each run. Nothing in a backend computes a rate, a
+Backends supply raw inputs only: core/ingest.py times the write phases and
+records counts and progress checkpoints, and core/egress.py times each query
+run; the adapters only call their backend. Nothing in a backend computes a rate, a
 percentile or any other derived number, so every backend is summarized by
 exactly the same code and the figures are comparable.
 
@@ -15,22 +15,25 @@ alike (see summarize()):
 A percentile is reported only when the series has enough samples for it to
 be more than the maximum (see min_samples()); otherwise it is null.
 
-Raw writer output (one JSON line per writer run, see backends/README.md):
+Raw ingest output (one JSON file per server host, written by core/ingest.py;
+see its docstring):
 
-    records         node-level records written
+    records         node records written
     list_entries    list-attribute entries written (0 without list attributes)
-    errors          failed writes
-    batch, rate     the writer's own settings, echoed
-    start_epoch_s   wall-clock time at which the write began
-    open_s          container/connection open time, if the writer has one
-    write_s         first record inserted -> last record committed
-    close_sync_s    close and flush to stable storage (0 if there is none)
-    checkpoints     [[seconds since write start, records written so far], ...]
+    errors          samples that failed to write
+    batch, rate     the run's own settings, echoed
+    start_epoch_s   wall-clock time at which the write phase began
+    open_s          one-time setup: connect, open the container, schemas
+    write_s         first record -> last commit returned (generation included)
+    sync_s          making the data durable and visible (0 if no such step)
+    close_s         teardown; reported, not part of any rate
+    durability      what sync_s guarantees for this backend
+    checkpoints     [[seconds since write start, samples done so far], ...]
                     beginning with [0, 0], one entry at the end of every batch
-                    (after its commit or request completed) and a last one
-                    when the write finished
+                    (after its commit returned) and a last one when the write
+                    finished
 
-A batch is the writer's unit of work: `batch` node records committed or sent
+A batch is the unit of work: `batch` node records committed or sent
 together. Each interval between two checkpoints is therefore one batch (a
 "window"), and its duration is that batch's latency. A final batch smaller
 than `batch` is left out of the distributions (it is still part of the totals).
@@ -109,7 +112,7 @@ def windows(checkpoints, batch=0):
     """Intervals between consecutive checkpoints as (seconds, records).
 
     Intervals with no elapsed time or no records are dropped. When *batch*
-    (the writer's batch size) is given, so is any interval with fewer
+    (the run's batch size) is given, so is any interval with fewer
     records than that: a final partial batch would only add noise to a
     distribution of equally sized windows.
     """
@@ -125,10 +128,10 @@ def windows(checkpoints, batch=0):
 
 
 def ingest_host(raw):
-    """Statistics for one writer run, from its raw JSON (see module docstring)."""
+    """Statistics for one ingest run, from its raw JSON (see module docstring)."""
     records = raw.get("records")
     write_s = raw.get("write_s")
-    sync_s = raw.get("close_sync_s") or 0.0
+    sync_s = raw.get("sync_s") or 0.0
     batch = int(raw.get("batch") or 0)
     wins = windows(raw.get("checkpoints") or [], batch)
     durable_s = write_s + sync_s if write_s is not None else None
@@ -141,6 +144,7 @@ def ingest_host(raw):
         "open_s": raw.get("open_s"),
         "write_s": write_s,
         "sync_s": sync_s,
+        "close_s": raw.get("close_s"),
         "records_per_s": _r(rate(records, write_s)),
         "durable_records_per_s": _r(rate(records, durable_s)),
         "window_records": batch or records,
@@ -150,7 +154,7 @@ def ingest_host(raw):
 
 
 def ingest_summary(raws):
-    """Statistics across all writer runs of one write phase.
+    """Statistics across all ingest runs of one write phase.
 
     Wall time is measured from the earliest write start to the latest write
     end using the hosts' wall clocks (so it assumes they are synchronized);

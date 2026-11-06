@@ -41,7 +41,7 @@ still reports SKIP for this adapter (see STATUS.md).
 import os
 import re
 
-from adapter import Adapter, BackendError
+from egress_adapter import EgressAdapter, BackendError
 
 # Matches the table name in "... from <name> ...", case-insensitively, the
 # only part of a SOS query string postprocess() needs to read.
@@ -90,7 +90,7 @@ def _probe(ctx):
     return f"select timestamp from {ctx['schema']} order_by timestamp limit 1"
 
 
-class SosAdapter(Adapter):
+class SosAdapter(EgressAdapter):
     """Query SOS containers directly on disk (no dsosd)."""
 
     name = "sos"

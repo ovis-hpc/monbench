@@ -25,15 +25,17 @@ is the starting point for others.
 | `bin/run.sh` | Driver: runs each phase on the right nodes via ssh, Slurm or by hand |
 | `bin/node.sh` | Actions executed on a single node; calls the backend's hooks |
 | `core/dataset.py` | The data set: value rules, parameters, metadata files |
-| `core/bench.py` | Query engine: runs a query set, verifies and times each query |
-| `core/adapter.py` | The interface query adapters implement |
+| `core/ingest.py`, `core/ingest.c` | Ingest engines (Python and C): generate the records, drive the write, time its phases and save the raw result; also print the write summary |
+| `core/ingest_adapter.py` | The interface ingest adapters implement (`core/ingest.h` for C) |
+| `core/egress.py` | Query engine: runs a query set, verifies and times each query |
+| `core/egress_adapter.py` | The interface query adapters implement |
 | `dataset/default.json` | Data set definition: attributes and keys |
 | `queries/default.json` | Default query set, used when `QUERY_FILE` is empty |
 | `EXTENDING.md` | How to add a backend, define a dataset, or write a query file |
 | `backends/README.md` | Summary of backends provided and their capabilities |
-| `backends/sos/` | SOS backend: local containers, C and Python writers, direct query adapter |
-| `backends/dsos/` | DSOS backend: distributed query through `dsosd`, DSOS writer, `dsosql` adapter |
-| `backends/influxdb/` | InfluxDB v3 backend: writer, Python and HTTP query adapters |
+| `backends/sos/` | SOS backend: local containers, C and Python ingest adapters, direct query adapter |
+| `backends/dsos/` | DSOS backend: distributed query through `dsosd`, DSOS ingest adapter, `dsosql` adapter |
+| `backends/influxdb/` | InfluxDB v3 backend: ingest adapter, Python and HTTP query adapters |
 | `backends/template/` | Skeleton for a new backend |
 | `slurm/monbench.sbatch` | Batch script for a Slurm job |
 | `ROADMAP.md` | Current limitations, and what is planned or deferred, with the reasons |
@@ -247,7 +249,7 @@ without actually running it:
   written, started, stopped, or deleted.
 - `check` and `query` resolve and print every query's final, placeholder-
   filled text exactly as it would be sent, but never connect to the backend
-  or actually send it (`core/bench.py`, which reports each query with status
+  or actually send it (`core/egress.py`, which reports each query with status
   `DRY` instead of checking or timing it — see `OUTPUT.md`).
 
 ```bash

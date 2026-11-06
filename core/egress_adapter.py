@@ -1,12 +1,12 @@
-"""adapter.py -- the interface every backend's query adapter implements.
+"""egress_adapter.py -- the interface every backend's query adapter implements.
 
 A backend plugin provides backends/<name>/query/<name>_query.py, which defines one or more
-subclasses of Adapter and two module attributes:
+subclasses of EgressAdapter and two module attributes:
 
     ADAPTERS = {"<adapter-name>": AdapterClass, ...}
     DEFAULT_ADAPTER = "<adapter-name>"
 
-The engine (core/bench.py) loads that module by file path, so plugins need no
+The engine (core/egress.py) loads that module by file path, so plugins need no
 installation and no change to the core.
 """
 
@@ -15,7 +15,7 @@ class BackendError(Exception):
     """The backend cannot be used: not reachable, wrong type, or no data."""
 
 
-class Adapter:
+class EgressAdapter:
     #: Name used in QUERY_ADAPTER and as a key in query-set files.
     name = None
     #: Query language. Query sets may give one string per dialect, so
@@ -37,7 +37,7 @@ class Adapter:
     def __init__(self, ctx):
         """ctx: dict with
              target     storage target name (container, measurement, ...).
-                        Populated by bench.py from the backend plugin's meta
+                        Populated by egress.py from the backend plugin's meta
                         file at OUTPUT_DIR/meta/ingest-handoff-<writer>.json,
                         which the plugin writes during the write phase. The
                         query adapter does not need to know how the name was
@@ -78,7 +78,7 @@ class Adapter:
     def postprocess(self, text, columns, rows):
         """Backend-specific shaping of a query's full, assembled result,
         after every batch has been merged and column names reversed back
-        to dataset attribute names (core/bench.py's collect()) -- used
+        to dataset attribute names (core/egress.py's collect()) -- used
         for verification only, like records(), and likewise not timed.
 
         Default: no-op (most backends need none). Exists for a backend

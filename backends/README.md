@@ -9,7 +9,7 @@ backends/<n>/
   <n>_backend.conf   settings and declarations
   <n>_plugin.sh      lifecycle hooks: build, write, serve, stop, clean
   query/<n>_query.py  query adapters
-  writer/                writers (if any)
+  writer/<n>_write.py ingest adapter (and any C sources); run by core/ingest.py
   ...                    anything else the backend needs (tools, etc.)
 ```
 
@@ -21,7 +21,7 @@ error before doing anything.
 To add a backend, copy `backends/template/` to `backends/<n>/` and rename
 each file with your backend's name as a prefix: `<n>_plugin.sh`,
 `<n>_backend.conf`, `query/<n>_query.py`. See `EXTENDING.md` for the full
-contract: config declarations, plugin hooks, writer summary format, plugin
+contract: config declarations, plugin hooks, ingest adapter interface and raw result format, plugin
 meta files, query adapter interface, `type_overrides`, and a testing
 walkthrough.
 

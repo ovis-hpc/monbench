@@ -42,8 +42,9 @@ plugin_write() { # WRITER MODE INDEX SERVER_ID
 	local target
 	target="$(ds_name)_${writer}"
 	# Replace any existing data for this partition, then write partition
-	# INDEX of the data set. Print one JSON summary line; see
-	# backends/README.md.
+	# INDEX of the data set by running core/ingest.py, which loads
+	# writer/<name>_write.py, times the write and saves the raw result to
+	# the --output file that dataset_args carries; see backends/README.md.
 	#
 	# The plugin constructs its own target name using ds_name() and records
 	# it in an ingest-handoff meta file for the query engine. See EXTENDING.md,
@@ -52,8 +53,9 @@ plugin_write() { # WRITER MODE INDEX SERVER_ID
 	# Route the actual writer invocation through run_logged so -d reports
 	# it; if your writer reads DATASET (or anything else) from its own
 	# environment rather than a flag, name it explicitly, e.g.:
-	#   run_logged DATASET="${DATASET}" -- "${PYTHON}" "${PLUGIN_DIR}/writer/<name>_write.py" \
-	#       --target "$target" --node-index "$index" "${dataset_args[@]}"
+	#   run_logged DATASET="${DATASET}" -- "${PYTHON}" "${BENCH_DIR}/core/ingest.py" \
+	#       --backend <name> --writer "$writer" --target "$target" \
+	#       --node-index "$index" "${dataset_args[@]}"
 	#
 	# After writing, record the ingest-handoff meta file:
 	#   cat > "${OUTPUT_DIR}/meta/ingest-handoff-${writer}.json" <<-EOF

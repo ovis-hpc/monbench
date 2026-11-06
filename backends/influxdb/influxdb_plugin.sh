@@ -90,7 +90,8 @@ plugin_write() { # WRITER MODE INDEX SERVER_ID
 	log "writing ${measurement} to ${INFLUX_DATABASE} (influx writer, ${INFLUX_INTERFACE} interface) on ${INFLUX_HOST}"
 	_influx_write_meta "$writer" "$measurement"
 	run_logged DATASET="${DATASET}" -- \
-		"${PYTHON}" "${INFLUX_DIR}/writer/influx_write.py" \
+		"${PYTHON}" "${BENCH_DIR}/core/ingest.py" \
+		--backend influxdb --adapter influx --writer "$writer" \
 		--measurement "$measurement" --node-index "$index" \
 		"${args[@]}" --batch "${INFLUX_WRITE_BATCH}" \
 		--interface "${INFLUX_INTERFACE}" \

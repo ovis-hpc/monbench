@@ -20,7 +20,7 @@ import os
 import re
 import subprocess
 
-from adapter import Adapter, BackendError
+from egress_adapter import EgressAdapter, BackendError
 
 # Matches the table name in "... from <name> ...", case-insensitively --
 # see backends/sos/query/sos_query.py's _dedup_list_rows() docstring,
@@ -32,7 +32,7 @@ _IDENTITY_COLS = ("component_id", "job_id", "seq")
 def _dedup_list_rows(ctx, text, columns, rows):
     """Identical to sos_query.py's helper of the same name -- duplicated
     rather than shared, consistent with every backend's query adapter
-    being a single self-contained file loaded by path (core/bench.py's
+    being a single self-contained file loaded by path (core/egress.py's
     load_plugin()); see that file's docstring for the full rationale."""
     m = _FROM_RE.search(text)
     if not m or m.group(1) == ctx["schema"]:
@@ -69,7 +69,7 @@ def _probe(ctx):
     return f"select timestamp from {ctx['schema']} order_by timestamp limit 1"
 
 
-class DsosAdapter(Adapter):
+class DsosAdapter(EgressAdapter):
     name = "dsos"
     dialect = "dsos"
 
@@ -114,7 +114,7 @@ class DsosAdapter(Adapter):
         self.session = None
 
 
-class DsosqlAdapter(Adapter):
+class DsosqlAdapter(EgressAdapter):
     name = "dsosql"
     dialect = "dsos"
     PROMPT = "dsosql: "

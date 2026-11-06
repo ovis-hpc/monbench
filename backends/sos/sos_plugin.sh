@@ -74,8 +74,8 @@ plugin_write() { # WRITER MODE INDEX SERVER_ID
 	# so it lives in OUTPUT_DIR/meta/.
 	template="${OUTPUT_DIR}/meta/sos-schema.json"
 	"${PYTHON}" "${SOS_DIR}/make_schema.py" "${DATASET}" "$template"
-	local args=(--path "$path" --template "$template" --node-index "$index"
-		"${dataset_args[@]}" --storage "${SOS_STORAGE}")
+	local args=(--writer "$writer" --path "$path" --template "$template"
+		--node-index "$index" "${dataset_args[@]}" --storage "${SOS_STORAGE}")
 	log "writing ${target} (${writer} writer, SOS ${SOS_STORAGE}) to ${path}"
 	# Record where we stored data so the query side can find it.
 	_sos_write_meta "$writer" "$target" "$id"
@@ -96,7 +96,8 @@ plugin_write() { # WRITER MODE INDEX SERVER_ID
 		fi
 		;;
 	py)
-		run_logged DATASET="${DATASET}" -- "${PYTHON}" "${SOS_DIR}/writer/sos_write.py" "${args[@]}"
+		run_logged DATASET="${DATASET}" -- "${PYTHON}" "${BENCH_DIR}/core/ingest.py" \
+			--backend sos --adapter py "${args[@]}"
 		;;
 	*)
 		die "the sos backend has no writer '$writer' (available: c py)"

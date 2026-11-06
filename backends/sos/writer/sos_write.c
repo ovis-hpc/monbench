@@ -1,6 +1,11 @@
 /*
- * sos_write -- write a deterministic data set into a local SOS
- * container using the SOS C API.
+ * sos_write -- C ingest adapter: write a deterministic data set into a
+ * local SOS container using the SOS C API.
+ *
+ * The record generation, loop, batching, throttling, timing and the raw
+ * result file belong to the C ingest engine (core/ingest.c, see
+ * core/ingest.h); this file only fills in the callbacks that call the SOS
+ * API and hands them to ingest_run().
  *
  * Every record is a pure function of (component_id, seq), so any reader
  * can verify a record without knowing which node wrote it. component_id,
@@ -28,87 +33,13 @@
 #include <string.h>
 #include <strings.h>
 #include <errno.h>
-#include <getopt.h>
-#include <time.h>
 #include <uuid/uuid.h>
 #include <jansson.h>
 #include <sos/sos.h>
 #include "dataset.h"
+#include "ingest.h"
 
 #define MAX_JOIN_ATTRS 16
-/* Max entry instances a single (comp, seq) sample can produce, across
- * every declared list attribute -- see write_list_entry()'s caller in
- * main(). Every dataset JSON seen so far declares at most a handful per
- * list attribute (dataset/curated_metrics_like.json: 2 cpu + up to 4
- * netdev); this is comfortably larger, with room for a list attribute
- * declaring a wider length range. */
-#define MAX_LIST_RECS 256
-
-struct opts {
-	const char *path;
-	const char *template_path;
-	const char *backend;
-	int node_index;
-	uint64_t components;
-	uint64_t samples;
-	uint64_t t0;
-	uint64_t interval;
-	uint64_t job_len;
-	uint64_t batch;
-	double rate;		/* records per second, 0 = unthrottled */
-};
-
-static void usage(const char *prog)
-{
-	fprintf(stderr,
-		"usage: %s --path PATH --template JSON --node-index N\n"
-		"          [--components N] [--samples N] [--t0 SECS] [--interval SECS]\n"
-		"          [--job-len N] [--batch N] [--rate RECS_PER_SEC]\n"
-		"          [--storage mmos|lsos]\n"
-		"       (DATASET env var must name the dataset JSON file)\n", prog);
-	exit(2);
-}
-
-static double now_s(void)
-{
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return ts.tv_sec + ts.tv_nsec / 1e9;
-}
-
-static double now_epoch_s(void)
-{
-	struct timespec ts;
-	clock_gettime(CLOCK_REALTIME, &ts);
-	return ts.tv_sec + ts.tv_nsec / 1e9;
-}
-
-/* Progress checkpoints: seconds since the write began and node records
- * written so far, one per batch. They are reported raw; core/stats.py
- * derives every rate and percentile from them. */
-struct checkpoint {
-	double t;
-	uint64_t n;
-};
-static struct checkpoint *cps;
-static size_t n_cps, cap_cps;
-
-static void add_checkpoint(double t, uint64_t n)
-{
-	if (n_cps == cap_cps) {
-		size_t cap = cap_cps ? cap_cps * 2 : 1024;
-		struct checkpoint *p = realloc(cps, cap * sizeof(*p));
-		if (!p) {
-			fprintf(stderr, "error: out of memory recording checkpoints\n");
-			exit(1);
-		}
-		cps = p;
-		cap_cps = cap;
-	}
-	cps[n_cps].t = t;
-	cps[n_cps].n = n;
-	n_cps++;
-}
 
 static const struct {
 	const char *name;
@@ -145,7 +76,7 @@ static int lookup_type(const char *name, sos_type_t *type)
  * Takes an already-parsed json_t* rather than loading its own file,
  * because the template file now holds more than one such object --
  * {"node": {...}, "lists": {"<name>": {...}, ...}} (see
- * backends/sos/make_schema.py) -- loaded once by main() into a single
+ * backends/sos/make_schema.py) -- loaded once by sos_adapter_open() into a single
  * json_t* tree that this function's caller slices up.
  */
 static sos_schema_t schema_from_template_obj(json_t *tmpl)
@@ -226,7 +157,7 @@ err:
 	sos_schema_free(schema);
 	schema = NULL;
 out:
-	/* tmpl is owned by the caller (it is a slice of main()'s single
+	/* tmpl is owned by the caller (it is a slice of sos_adapter_open()'s single
 	 * parsed template tree); this function does not decref it. */
 	return schema;
 }
@@ -396,10 +327,10 @@ struct value_attr {
 
 /* Write one resolved value attribute's value, dispatching on *da*'s
  * family and (for DS_FAMILY_UINT/DS_FAMILY_INT) exact declared width --
- * the single place both the flat write loop and write_list_entry() go
+ * the single place both sos_adapter_write() and write_list_entry() go
  * through, so the two can never diverge on how a given family/width is
  * written. Only ever called for a UINT/INT/DOUBLE/STRING attribute (see
- * the flat resolution loop in main() and build_list_writer(), which are
+ * the flat resolution loop in sos_adapter_open() and build_list_writer(), which are
  * what decide which families get a value_attr at all; DS_FAMILY_TIMESTAMP
  * never does, since the identity timestamp attribute is written directly
  * via set_ts(), not through this dispatcher).
@@ -459,7 +390,7 @@ struct list_writer {
 };
 
 /* Resolve one list attribute's schema and value attrs. *list_tmpl* is
- * root["lists"][list->name] from main()'s parsed template tree -- built
+ * root["lists"][list->name] from sos_adapter_open()'s parsed template tree -- built
  * by backends/sos/make_schema.py's convert_list(), which gives every
  * entry attribute a real SOS type, signed integers included. Every
  * tuple field (or the bare-scalar "value" column) gets a value_attr
@@ -500,7 +431,7 @@ static int build_list_writer(sos_t sos, json_t *list_tmpl, const ds_list_t *list
 }
 
 /* Write one entry instance (a ds_expected_lists() record) into its list
- * attribute's schema -- the per-list analog of the flat write loop's
+ * attribute's schema -- the per-list analog of sos_adapter_write()'s
  * body below. Returns non-zero on failure: either sos_obj_index()'s rc,
  * or -1 if any of this entry's values failed to write (see set_value()),
  * checked before indexing so a failed value write is never silently
@@ -535,132 +466,92 @@ static int write_list_entry(struct list_writer *lw, uint64_t comp, uint64_t job_
 	return value_err ? value_err : rc;
 }
 
-int main(int argc, char **argv)
-{
-	struct opts o = {
-		.backend = "mmos", .node_index = -1, .components = 16,
-		.samples = 5000, .t0 = 1700000000, .interval = 1,
-		.job_len = 500, .batch = 500, .rate = 0,
-	};
-	static struct option long_opts[] = {
-		{ "path", required_argument, 0, 'p' },
-		{ "template", required_argument, 0, 'T' },
-		{ "node-index", required_argument, 0, 'n' },
-		{ "components", required_argument, 0, 'c' },
-		{ "samples", required_argument, 0, 's' },
-		{ "t0", required_argument, 0, 't' },
-		{ "interval", required_argument, 0, 'i' },
-		{ "job-len", required_argument, 0, 'j' },
-		{ "batch", required_argument, 0, 'b' },
-		{ "rate", required_argument, 0, 'r' },
-		{ "storage", required_argument, 0, 'B' },
-		{ 0, 0, 0, 0 }
-	};
-	int opt;
-	while ((opt = getopt_long(argc, argv, "", long_opts, NULL)) != -1) {
-		switch (opt) {
-		case 'p': o.path = optarg; break;
-		case 'T': o.template_path = optarg; break;
-		case 'n': o.node_index = atoi(optarg); break;
-		case 'c': o.components = strtoull(optarg, NULL, 0); break;
-		case 's': o.samples = strtoull(optarg, NULL, 0); break;
-		case 't': o.t0 = strtoull(optarg, NULL, 0); break;
-		case 'i': o.interval = strtoull(optarg, NULL, 0); break;
-		case 'j': o.job_len = strtoull(optarg, NULL, 0); break;
-		case 'b': o.batch = strtoull(optarg, NULL, 0); break;
-		case 'r': o.rate = strtod(optarg, NULL); break;
-		case 'B': o.backend = optarg; break;
-		default: usage(argv[0]);
-		}
-	}
-	if (!o.path || !o.template_path || o.node_index < 0 ||
-	    !o.batch || !o.job_len || !o.interval)
-		usage(argv[0]);
+struct sos_ctx {
+	const char *path;
+	const char *template_path;
+	const char *storage;		/* mmos or lsos */
 
-	const char *dataset_path = getenv("DATASET");
-	if (!dataset_path) {
-		fprintf(stderr, "error: DATASET env var is not set\n");
-		return 1;
-	}
-	/* The authoritative attribute list, types, and decode rules come
-	 * from the dataset definition (DATASET env var) -- loaded and
-	 * resolved once here via core/dataset.c, the same file
-	 * sos_write.py, dsos_write.py and influx_write.py all load
-	 * through core/dataset.py, so every writer produces identical
-	 * values for a given dataset with no change needed here when the
-	 * dataset's JSON changes. */
-	dataset_t ds;
-	char ds_err[256];
-	if (ds_load(&ds, dataset_path, o.t0, o.interval, o.job_len, ds_err, sizeof(ds_err))) {
-		fprintf(stderr, "error loading dataset '%s': %s\n", dataset_path, ds_err);
-		return 1;
-	}
+	const dataset_t *ds;
+	sos_t sos;
+	json_t *tmpl_root;
+	sos_schema_t schema;
+	sos_attr_t a_ts, a_comp, a_job, a_seq;
+	int idx_ts, idx_comp, idx_job, idx_seq;
+	struct value_attr value_attrs[DS_MAX_ATTRS];
+	size_t n_value_attrs;
+	struct list_writer list_writers[DS_MAX_LISTS];
+	int in_txn;
+	unsigned errors_shown;
+};
+
+#define MAX_ERRORS_SHOWN 10
+
+static int sos_adapter_open(void *vctx, const dataset_t *ds, const struct ingest_opts *o)
+{
+	struct sos_ctx *x = vctx;
+	(void)o;
+	x->ds = ds;
 
 	sos_perm_t perm = SOS_PERM_CREAT | SOS_PERM_RW;
-	perm |= (0 == strcasecmp(o.backend, "lsos")) ? SOS_BE_LSOS : SOS_BE_MMOS;
-
-	double t_start = now_s();
-	sos_t sos = sos_container_open(o.path, perm, 0660);
-	if (!sos) {
-		fprintf(stderr, "error %d opening container '%s'\n", errno, o.path);
-		return 1;
+	perm |= (0 == strcasecmp(x->storage, "lsos")) ? SOS_BE_LSOS : SOS_BE_MMOS;
+	x->sos = sos_container_open(x->path, perm, 0660);
+	if (!x->sos) {
+		fprintf(stderr, "error %d opening container '%s'\n", errno, x->path);
+		return -1;
 	}
-	/* The template file now holds the node schema plus one schema per
+	/* The template file holds the node schema plus one schema per
 	 * declared list attribute (see backends/sos/make_schema.py's
 	 * build_templates()): {"node": {...}, "lists": {<name>: {...}}}.
-	 * Loaded once here into a single parsed tree; get_schema_obj()/
-	 * build_list_writer() below take slices of it directly rather than
-	 * each re-opening the file. */
+	 * Loaded once into a single parsed tree; get_schema_obj()/
+	 * build_list_writer() take slices of it directly rather than each
+	 * re-opening the file. */
 	json_error_t tmpl_jerr;
-	json_t *tmpl_root = json_load_file(o.template_path, 0, &tmpl_jerr);
-	if (!tmpl_root) {
-		fprintf(stderr, "error: %s:%d: %s\n", o.template_path,
+	x->tmpl_root = json_load_file(x->template_path, 0, &tmpl_jerr);
+	if (!x->tmpl_root) {
+		fprintf(stderr, "error: %s:%d: %s\n", x->template_path,
 			tmpl_jerr.line, tmpl_jerr.text);
-		return 1;
+		return -1;
 	}
-	json_t *node_tmpl = json_object_get(tmpl_root, "node");
-	json_t *lists_tmpl = json_object_get(tmpl_root, "lists");
+	json_t *node_tmpl = json_object_get(x->tmpl_root, "node");
+	json_t *lists_tmpl = json_object_get(x->tmpl_root, "lists");
 	if (!node_tmpl) {
-		fprintf(stderr, "error: %s: missing 'node'\n", o.template_path);
-		return 1;
+		fprintf(stderr, "error: %s: missing 'node'\n", x->template_path);
+		return -1;
 	}
 
-	sos_schema_t schema = get_schema_obj(sos, node_tmpl);
-	if (!schema)
-		return 1;
-	sos_attr_t a_ts = must_attr(schema, "timestamp");
-	sos_attr_t a_comp = must_attr(schema, "component_id");
-	sos_attr_t a_job = must_attr(schema, "job_id");
-	sos_attr_t a_seq = must_attr(schema, "seq");
-	int idx_ts = ds_attr_index(&ds, "timestamp");
-	int idx_comp = ds_attr_index(&ds, "component_id");
-	int idx_job = ds_attr_index(&ds, "job_id");
-	int idx_seq = ds_attr_index(&ds, "seq");
+	x->schema = get_schema_obj(x->sos, node_tmpl);
+	if (!x->schema)
+		return -1;
+	x->a_ts = must_attr(x->schema, "timestamp");
+	x->a_comp = must_attr(x->schema, "component_id");
+	x->a_job = must_attr(x->schema, "job_id");
+	x->a_seq = must_attr(x->schema, "seq");
+	x->idx_ts = ds_attr_index(ds, "timestamp");
+	x->idx_comp = ds_attr_index(ds, "component_id");
+	x->idx_job = ds_attr_index(ds, "job_id");
+	x->idx_seq = ds_attr_index(ds, "seq");
 
 	/* Resolve every other dataset attribute to its SOS attr handle
 	 * once, up front -- see the struct value_attr comment. Every
 	 * family (including signed integers) is resolved here and written
 	 * through set_value(). */
-	struct value_attr value_attrs[DS_MAX_ATTRS];
-	size_t n_value_attrs = 0;
 	size_t ai;
-	for (ai = 0; ai < ds.n_attrs; ai++) {
-		const ds_attr_t *da = &ds.attrs[ai];
+	for (ai = 0; ai < ds->n_attrs; ai++) {
+		const ds_attr_t *da = &ds->attrs[ai];
 		if (da->is_identity)
 			continue;
-		value_attrs[n_value_attrs].sos_attr = must_attr(schema, da->name);
-		value_attrs[n_value_attrs].idx = ai;
-		value_attrs[n_value_attrs].attr = da;
-		n_value_attrs++;
+		x->value_attrs[x->n_value_attrs].sos_attr = must_attr(x->schema, da->name);
+		x->value_attrs[x->n_value_attrs].idx = ai;
+		x->value_attrs[x->n_value_attrs].attr = da;
+		x->n_value_attrs++;
 	}
 
 	/* Resolve each declared list attribute's schema and value attrs
 	 * once, up front, same as the flat attrs above -- see struct
 	 * list_writer and build_list_writer(). */
-	struct list_writer list_writers[DS_MAX_LISTS];
 	size_t li;
-	for (li = 0; li < ds.n_lists; li++) {
-		const ds_list_t *list = &ds.lists[li];
+	for (li = 0; li < ds->n_lists; li++) {
+		const ds_list_t *list = &ds->lists[li];
 		json_t *list_tmpl = lists_tmpl
 			? json_object_get(lists_tmpl, list->name) : NULL;
 		if (!list_tmpl) {
@@ -668,143 +559,130 @@ int main(int argc, char **argv)
 				"error: %s: 'lists' has no template for list attribute "
 				"'%s' (DATASET and the template file must come from "
 				"the same dataset JSON, via make_schema.py)\n",
-				o.template_path, list->name);
-			return 1;
+				x->template_path, list->name);
+			return -1;
 		}
-		if (build_list_writer(sos, list_tmpl, list, &list_writers[li]))
-			return 1;
+		if (build_list_writer(x->sos, list_tmpl, list, &x->list_writers[li]))
+			return -1;
+	}
+	return 0;
+}
+
+static int sos_adapter_write(void *vctx, uint64_t comp, uint64_t seq,
+			     const ds_value_t *values,
+			     const ds_list_rec_t *lists, int n_lists)
+{
+	struct sos_ctx *x = vctx;
+	size_t vi;
+	int ri, rc, failed = 0, value_err = 0;
+
+	if (!x->in_txn) {
+		rc = sos_begin_x(x->sos);
+		if (rc) {
+			fprintf(stderr, "error %d beginning transaction\n", rc);
+			return -1;
+		}
+		x->in_txn = 1;
 	}
 
-	uint64_t base = (uint64_t)(o.node_index + 1) * 1000;
-	uint64_t written = 0, in_batch = 0, errors = 0, list_entries = 0;
-	uint64_t seq, c;
-	int rc;
-	double start_epoch = now_epoch_s();
-	double t_write = now_s();
-	add_checkpoint(0.0, 0);
-
-	rc = sos_begin_x(sos);
-	if (rc) {
-		fprintf(stderr, "error %d beginning transaction\n", rc);
-		return 1;
+	sos_obj_t obj = sos_obj_new(x->schema);
+	if (!obj) {
+		fprintf(stderr, "error %d allocating object\n", errno);
+		return -1;
 	}
-	for (seq = 0; seq < o.samples; seq++) {
-		for (c = 0; c < o.components; c++) {
-			uint64_t comp = base + c;
-			ds_value_t values[DS_MAX_ATTRS];
-			size_t vi;
-			int value_err = 0;
+	set_ts(obj, x->a_ts, values[x->idx_ts].u64);
+	set_u64(obj, x->a_comp, values[x->idx_comp].u64);
+	set_u64(obj, x->a_job, values[x->idx_job].u64);
+	set_u64(obj, x->a_seq, values[x->idx_seq].u64);
+	for (vi = 0; vi < x->n_value_attrs; vi++) {
+		const struct value_attr *va = &x->value_attrs[vi];
+		if (set_value(obj, va->attr, va->sos_attr, &values[va->idx]))
+			value_err = 1;
+	}
+	rc = sos_obj_index(obj);
+	sos_obj_put(obj);
+	if (rc || value_err) {
+		failed = 1;
+		if (x->errors_shown++ < MAX_ERRORS_SHOWN)
+			fprintf(stderr, "error %d indexing record (%" PRIu64 ", %" PRIu64 ")%s\n",
+				rc, comp, seq, value_err ? " (value write failed)" : "");
+	}
 
-			ds_expected(&ds, comp, seq, values);
-
-			sos_obj_t obj = sos_obj_new(schema);
-			if (!obj) {
-				fprintf(stderr, "error %d allocating object\n", errno);
-				return 1;
-			}
-			set_ts(obj, a_ts, values[idx_ts].u64);
-			set_u64(obj, a_comp, values[idx_comp].u64);
-			set_u64(obj, a_job, values[idx_job].u64);
-			set_u64(obj, a_seq, values[idx_seq].u64);
-			for (vi = 0; vi < n_value_attrs; vi++) {
-				const struct value_attr *va = &value_attrs[vi];
-				if (set_value(obj, va->attr, va->sos_attr, &values[va->idx]))
-					value_err = 1;
-			}
-			rc = sos_obj_index(obj);
-			sos_obj_put(obj);
-			if (rc || value_err) {
-				errors++;
-				if (errors <= 10)
-					fprintf(stderr, "error %d indexing record %" PRIu64 "%s\n",
-						rc, written,
-						value_err ? " (value write failed)" : "");
-			}
-			written++;
-
-			if (ds.n_lists) {
-				static ds_list_rec_t list_recs[MAX_LIST_RECS];
-				int n_recs = ds_expected_lists(
-					&ds, comp, values[idx_job].u64, seq,
-					list_recs, MAX_LIST_RECS);
-				int ri;
-				if (n_recs < 0) {
-					fprintf(stderr,
-						"error: record %" PRIu64 ": more than %d list "
-						"entry instances; raise MAX_LIST_RECS\n",
-						written, MAX_LIST_RECS);
-					return 1;
-				}
-				for (ri = 0; ri < n_recs; ri++) {
-					const ds_list_rec_t *rec = &list_recs[ri];
-					/* rec->list points into ds.lists[] (see
-					 * ds_expected_lists() in core/dataset.c),
-					 * so its offset from ds.lists is that list
-					 * attribute's index into list_writers[],
-					 * built in the same order above. */
-					size_t lwi = (size_t)(rec->list - ds.lists);
-					rc = write_list_entry(&list_writers[lwi], comp,
-						values[idx_job].u64, seq,
-						values[idx_ts].u64, rec);
-					if (!rc)
-						list_entries++;
-					if (rc) {
-						errors++;
-						if (errors <= 10)
-							fprintf(stderr,
-								"error %d indexing %s[%" PRIu64 "] "
-								"for record %" PRIu64 "\n",
-								rc, rec->list->name, rec->index, written);
-					}
-				}
-			}
-
-			if (++in_batch == o.batch) {
-				sos_container_commit(sos, SOS_COMMIT_ASYNC);
-				sos_end_x(sos);
-				add_checkpoint(now_s() - t_write, written);
-				in_batch = 0;
-				sos_begin_x(sos);
-			}
-			if (o.rate > 0) {
-				double due = t_write + written / o.rate;
-				double wait = due - now_s();
-				if (wait > 0) {
-					struct timespec ts = {
-						.tv_sec = (time_t)wait,
-						.tv_nsec = (long)((wait - (time_t)wait) * 1e9)
-					};
-					nanosleep(&ts, NULL);
-				}
-			}
+	for (ri = 0; ri < n_lists; ri++) {
+		const ds_list_rec_t *rec = &lists[ri];
+		/* rec->list points into ds->lists[] (see ds_expected_lists()
+		 * in core/dataset.c), so its offset from ds->lists is that
+		 * list attribute's index into list_writers[], built in the
+		 * same order in sos_adapter_open(). */
+		size_t lwi = (size_t)(rec->list - x->ds->lists);
+		rc = write_list_entry(&x->list_writers[lwi], comp,
+			values[x->idx_job].u64, seq, values[x->idx_ts].u64, rec);
+		if (rc) {
+			failed = 1;
+			if (x->errors_shown++ < MAX_ERRORS_SHOWN)
+				fprintf(stderr, "error %d indexing %s[%" PRIu64 "] "
+					"for record (%" PRIu64 ", %" PRIu64 ")\n",
+					rc, rec->list->name, rec->index, comp, seq);
 		}
 	}
-	sos_container_commit(sos, SOS_COMMIT_ASYNC);
-	sos_end_x(sos);
-	double t_indexed = now_s();
-	if (cps[n_cps - 1].n != written)
-		add_checkpoint(t_indexed - t_write, written);
-	sos_container_close(sos, SOS_COMMIT_SYNC);
-	double t_end = now_s();
+	return failed ? -1 : 0;
+}
 
-	/* One JSON line, parsed by bin/node.sh and bin/run.sh. It holds raw
-	 * inputs only; core/stats.py derives every rate and percentile. */
-	size_t k;
-	printf("{\"writer\": \"c\", \"container\": \"%s\", \"backend\": \"%s\", "
-	       "\"node_index\": %d, \"records\": %" PRIu64 ", "
-	       "\"list_entries\": %" PRIu64 ", \"errors\": %" PRIu64 ", "
-	       "\"batch\": %" PRIu64 ", \"rate\": %.0f, "
-	       "\"start_epoch_s\": %.6f, "
-	       "\"open_s\": %.3f, \"write_s\": %.3f, \"close_sync_s\": %.3f, "
-	       "\"checkpoints\": [",
-	       o.path, o.backend, o.node_index, written, list_entries, errors,
-	       o.batch, o.rate, start_epoch,
-	       t_write - t_start, t_indexed - t_write, t_end - t_indexed);
-	for (k = 0; k < n_cps; k++)
-		printf("%s[%.6f, %" PRIu64 "]", k ? ", " : "", cps[k].t, cps[k].n);
-	printf("]}\n");
-	free(cps);
-	ds_free(&ds);
-	json_decref(tmpl_root);
-	return errors ? 1 : 0;
+static int sos_adapter_commit(void *vctx)
+{
+	struct sos_ctx *x = vctx;
+	if (x->in_txn) {
+		sos_container_commit(x->sos, SOS_COMMIT_ASYNC);
+		sos_end_x(x->sos);
+		x->in_txn = 0;
+	}
+	return 0;
+}
+
+static int sos_adapter_sync(void *vctx)
+{
+	struct sos_ctx *x = vctx;
+	return sos_container_commit(x->sos, SOS_COMMIT_SYNC);
+}
+
+static int sos_adapter_close(void *vctx)
+{
+	struct sos_ctx *x = vctx;
+	sos_container_close(x->sos, SOS_COMMIT_ASYNC);
+	json_decref(x->tmpl_root);
+	return 0;
+}
+
+static struct ingest_kv sos_info[3];
+
+static const struct ingest_kv *sos_adapter_info(void *vctx)
+{
+	struct sos_ctx *x = vctx;
+	sos_info[0] = (struct ingest_kv){ "container", x->path };
+	sos_info[1] = (struct ingest_kv){ "backend", x->storage };
+	return sos_info;
+}
+
+int main(int argc, char **argv)
+{
+	static struct sos_ctx ctx = { .storage = "mmos" };
+	static const struct ingest_adapter adapter = {
+		.name = "c",
+		/* sync() commits synchronously; the pages are then on their way to
+		 * the storage the container's backend writes to. */
+		.durability = "sos_container_commit(SOS_COMMIT_SYNC)",
+		.open = sos_adapter_open,
+		.write = sos_adapter_write,
+		.commit = sos_adapter_commit,
+		.sync = sos_adapter_sync,
+		.close = sos_adapter_close,
+		.info = sos_adapter_info,
+	};
+	const struct ingest_extra_opt extra[] = {
+		{ "path", &ctx.path, 1 },
+		{ "template", &ctx.template_path, 1 },
+		{ "storage", &ctx.storage, 0 },
+		{ NULL, NULL, 0 },
+	};
+	return ingest_run(argc, argv, &adapter, &ctx, extra);
 }

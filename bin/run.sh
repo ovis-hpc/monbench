@@ -67,7 +67,7 @@
 #        stop and clean log the command they would run instead of running
 #        it (nothing is built, written, started, stopped, or deleted); check
 #        and query resolve and print every query's final text without ever
-#        connecting to the backend or sending it (core/bench.py, status
+#        connecting to the backend or sending it (core/egress.py, status
 #        DRY in its report). Forwarded to every node as DRY_RUN=1, so
 #        ssh/slurm steps honor it too; with -l manual you already see the
 #        command without -d, so it has no extra effect there besides also

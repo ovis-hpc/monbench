@@ -116,29 +116,25 @@ cmd_write() { # WRITER MODE INDEX ID
 	if [[ "$mode" == "live" ]]; then
 		samples="${LIVE_SAMPLES:-}" batch="${LIVE_BATCH:-}" rate="${LIVE_RATE:-}"
 	fi
+	# The plugin constructs the storage name and records it in a meta file.
+	# The ingest engine (core/ingest.py, or the C engine linked into a C
+	# writer) times the write and saves the raw result to --output under
+	# OUTPUT_DIR/results, keyed by the writer name and host; the plugin_write
+	# hook is responsible for naming the storage target.
+	mkdir -p "${OUTPUT_DIR}/results"
+	out="${OUTPUT_DIR}/results/ingest-${writer}-${HOST}-raw.json"
+	rm -f "$out"
 	# Data-set arguments every writer accepts (see backends/README.md).
 	dataset_args=(--components "${COMPONENT_IDS_PER_SERVER:-}" --samples "$samples"
 		--t0 "${T0:-}" --interval "${INTERVAL:-}" --job-len "${JOB_LEN:-}"
-		--batch "$batch" --rate "$rate")
-	# The plugin constructs the storage name and records it in a meta file.
-	# The writer's output (JSON summary) is saved under OUTPUT_DIR/results
-	# keyed by the writer name; the plugin_write hook is responsible for
-	# naming the storage target.
-	mkdir -p "${OUTPUT_DIR}/results"
-	out="${OUTPUT_DIR}/results/ingest-${writer}-${HOST}-raw.json"
-	local rc=0
-	# With pipefail, the pipeline fails when the writer fails.
-	hook write "$@" | tee "$out.tmp" || rc=1
-	# Keep only the writer's JSON summary line.
-	grep '^{' "$out.tmp" >"$out" || true
-	rm -f "$out.tmp"
-	return "$rc"
+		--batch "$batch" --rate "$rate" --output "$out")
+	hook write "$@"
 }
 
-cmd_bench() { # MODE WRITER [live]
+cmd_egress() { # MODE WRITER [live]
 	local args=(--writer "$2" --mode "$1")
 	[[ "${3:-}" == "live" ]] && args+=(--live)
-	"${PYTHON:-}" "${BENCH_DIR}/core/bench.py" "${args[@]}"
+	"${PYTHON:-}" "${BENCH_DIR}/core/egress.py" "${args[@]}"
 }
 
 # Delete this node's scratch tree and the shared metadata directory. Not
@@ -157,13 +153,13 @@ case "$action" in
 build) hook build ;;
 write) cmd_write "$@" ;;
 meta) "${PYTHON:-}" "${BENCH_DIR}/core/dataset.py" meta "$@" ;;
-write-summary) cmd_bench write-summary "$@" ;;
+write-summary) "${PYTHON:-}" "${BENCH_DIR}/core/ingest.py" write-summary --writer "$1" ;;
 serve-start) hook serve_start "$@" ;;
 serve-run) hook serve_run "$@" ;;
 serve-stop) hook serve_stop ;;
 serve-status) hook serve_status ;;
-check) cmd_bench check "$@" ;;
-query) cmd_bench query "$@" ;;
+check) cmd_egress check "$@" ;;
+query) cmd_egress query "$@" ;;
 clean) hook clean "$@" ;;
 wipe) cmd_wipe ;;
 *) sed -n '2,/^set -euo pipefail$/p' "$0" | sed '$d'; exit 2 ;;

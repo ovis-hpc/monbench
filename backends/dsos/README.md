@@ -47,7 +47,7 @@ mapping" for the full mapping table): one SOS schema per declared list
 attribute, named `{schema}_<name>`, built by the same
 `backends/sos/make_schema.py`.
 
-- **Writing:** `dsos_write.py` gained a `ListWriter` mirroring
+- **Writing:** the `dsos_write.py` ingest adapter gained a `ListWriter` mirroring
   `sos_write.py`'s -- it writes every entry instance
   (`Dataset.expected_lists()`) into its list attribute's schema through
   the same `dsosd` session the flat node records go through.
