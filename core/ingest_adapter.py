@@ -19,8 +19,9 @@ The engine times four phases, in this order:
 
     open    everything done once before the first record: connect, open or
             create the container, add schemas, discover the cluster.
-    write   first write() -> the last commit() returns. Record generation is
-            part of this phase.
+    write   the write() calls and the commit() calls, from the first write()
+            to the last commit() returning. Record generation is timed
+            apart from them and is not part of this phase.
     sync    sync(): make the data durable and visible to readers.
     close   close(): teardown only.
 

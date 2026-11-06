@@ -31,11 +31,11 @@ static double now_epoch_s(void)
 	return ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
-/* Progress checkpoints: seconds since the write began and samples done so
- * far, one per batch. They are reported raw; core/stats.py derives every
- * rate and percentile from them. */
+/* Progress checkpoints, one per batch: seconds since the loop began, the
+ * generation and store time so far, and the samples done. They are reported
+ * raw; core/stats.py derives every rate and percentile from them. */
 struct checkpoint {
-	double t;
+	double wall, generate, write;
 	uint64_t n;
 };
 
@@ -44,7 +44,8 @@ struct checkpoints {
 	size_t n, cap;
 };
 
-static int add_checkpoint(struct checkpoints *c, double t, uint64_t n)
+static int add_checkpoint(struct checkpoints *c, double wall, double generate,
+			  double write, uint64_t n)
 {
 	if (c->n == c->cap) {
 		size_t cap = c->cap ? c->cap * 2 : 1024;
@@ -54,10 +55,29 @@ static int add_checkpoint(struct checkpoints *c, double t, uint64_t n)
 		c->v = p;
 		c->cap = cap;
 	}
-	c->v[c->n].t = t;
-	c->v[c->n].n = n;
-	c->n++;
+	c->v[c->n++] = (struct checkpoint){ wall, generate, write, n };
 	return 0;
+}
+
+#define HIST_BUCKETS 64
+#define SLOW_CLOCK_NS 1000.0
+
+/* Log2 histogram of durations: bucket b counts [2^(b-1), 2^b) ns, bucket 0
+ * is under 1 ns. Same layout as core/ingest.py. */
+static inline void hist_add(uint64_t *hist, double seconds)
+{
+	uint64_t ns = (uint64_t)(seconds * 1e9);
+	int b = ns ? 64 - __builtin_clzll(ns) : 0;
+	hist[b < HIST_BUCKETS ? b : HIST_BUCKETS - 1]++;
+}
+
+static double timer_cost_ns(void)
+{
+	enum { READS = 20000 };
+	double t = now_s();
+	for (int i = 0; i < READS; i++)
+		(void)now_s();
+	return (now_s() - t) / READS * 1e9;
 }
 
 static void usage(const char *prog, const struct ingest_extra_opt *extra)
@@ -147,10 +167,28 @@ static void put_json_string(FILE *f, const char *s)
 	fputc('"', f);
 }
 
+struct run_result {
+	uint64_t records, list_entries, errors;
+	double start_epoch, end_epoch;
+	double open_s, loop_s, generate_s, write_call_s, commit_s, throttle_s;
+	double sync_s, close_s, timer_cost_ns;
+	double generate_max, write_max;
+	uint64_t generate_hist[HIST_BUCKETS], write_hist[HIST_BUCKETS];
+};
+
+static void put_hist(FILE *f, const char *key, const uint64_t *hist)
+{
+	int last = HIST_BUCKETS - 1;
+	while (last >= 0 && !hist[last])
+		last--;
+	fprintf(f, ", \"%s\": [", key);
+	for (int b = 0; b <= last; b++)
+		fprintf(f, "%s%" PRIu64, b ? ", " : "", hist[b]);
+	fprintf(f, "]");
+}
+
 static int save(const struct ingest_adapter *ad, void *ctx,
-		const struct ingest_opts *o, uint64_t records,
-		uint64_t list_entries, uint64_t errors, double start_epoch,
-		double open_s, double write_s, double sync_s, double close_s,
+		const struct ingest_opts *o, const struct run_result *r,
 		const struct checkpoints *cps)
 {
 	char tmp[4096];
@@ -169,10 +207,19 @@ static int save(const struct ingest_adapter *ad, void *ctx,
 	fprintf(f, ", \"node_index\": %d, \"records\": %" PRIu64
 		", \"list_entries\": %" PRIu64 ", \"errors\": %" PRIu64
 		", \"batch\": %" PRIu64 ", \"rate\": %.0f, "
-		"\"start_epoch_s\": %.6f, \"open_s\": %.6f, \"write_s\": %.6f, "
-		"\"sync_s\": %.6f, \"close_s\": %.6f",
-		o->node_index, records, list_entries, errors, o->batch, o->rate,
-		start_epoch, open_s, write_s, sync_s, close_s);
+		"\"start_epoch_s\": %.6f, \"end_epoch_s\": %.6f, "
+		"\"open_s\": %.6f, \"loop_s\": %.6f, \"generate_s\": %.6f, "
+		"\"write_s\": %.6f, \"write_call_s\": %.6f, \"commit_s\": %.6f, "
+		"\"throttle_s\": %.6f, \"sync_s\": %.6f, \"close_s\": %.6f, "
+		"\"timer_cost_ns\": %.1f, \"generate_max_s\": %.9f, "
+		"\"write_call_max_s\": %.9f",
+		o->node_index, r->records, r->list_entries, r->errors, o->batch, o->rate,
+		r->start_epoch, r->end_epoch, r->open_s, r->loop_s, r->generate_s,
+		r->write_call_s + r->commit_s, r->write_call_s, r->commit_s,
+		r->throttle_s, r->sync_s, r->close_s, r->timer_cost_ns,
+		r->generate_max, r->write_max);
+	put_hist(f, "generate_hist", r->generate_hist);
+	put_hist(f, "write_hist", r->write_hist);
 	const struct ingest_kv *kv = ad->info ? ad->info(ctx) : NULL;
 	for (; kv && kv->key; kv++) {
 		fprintf(f, ", ");
@@ -180,9 +227,11 @@ static int save(const struct ingest_adapter *ad, void *ctx,
 		fprintf(f, ": ");
 		put_json_string(f, kv->value ? kv->value : "");
 	}
-	fprintf(f, ", \"checkpoints\": [");
+	fprintf(f, ", \"checkpoint_fields\": [\"wall_s\", \"generate_s\", "
+		"\"write_s\", \"samples\"], \"checkpoints\": [");
 	for (size_t k = 0; k < cps->n; k++)
-		fprintf(f, "%s[%.6f, %" PRIu64 "]", k ? ", " : "", cps->v[k].t, cps->v[k].n);
+		fprintf(f, "%s[%.6f, %.6f, %.6f, %" PRIu64 "]", k ? ", " : "",
+			cps->v[k].wall, cps->v[k].generate, cps->v[k].write, cps->v[k].n);
 	fprintf(f, "]}\n");
 	if (fclose(f) || rename(tmp, o->output)) {
 		perror(o->output);
@@ -220,22 +269,27 @@ int ingest_run(int argc, char **argv, const struct ingest_adapter *ad,
 	int status = 2;
 	struct checkpoints cps = { 0 };
 	static ds_list_rec_t list_recs[MAX_LIST_RECS];
-	uint64_t records = 0, errors = 0, list_entries = 0, in_batch = 0, done = 0;
-	double open_s = 0, write_s = 0, sync_s = 0, close_s = 0, start_epoch;
+	static struct run_result r;
+	uint64_t in_batch = 0, done = 0;
 	double t;
+
+	r.timer_cost_ns = timer_cost_ns();
+	if (r.timer_cost_ns > SLOW_CLOCK_NS)
+		fprintf(stderr, "warning: a clock read costs %.0f ns here; the per-record "
+			"timings include that error\n", r.timer_cost_ns);
 
 	t = now_s();
 	if (ad->open(ctx, &ds, &o)) {
 		fprintf(stderr, "error: %s adapter: open failed\n", ad->name);
 		goto out;
 	}
-	open_s = now_s() - t;
+	r.open_s = now_s() - t;
 
 	uint64_t base = (uint64_t)(o.node_index + 1) * 1000;
-	double t_write;
-	start_epoch = now_epoch_s();
-	t_write = now_s();
-	if (add_checkpoint(&cps, 0.0, 0))
+	double t_loop;
+	r.start_epoch = now_epoch_s();
+	t_loop = now_s();
+	if (add_checkpoint(&cps, 0.0, 0.0, 0.0, 0))
 		goto nomem;
 	for (uint64_t seq = 0; seq < o.samples; seq++) {
 		for (uint64_t c = 0; c < o.components; c++) {
@@ -243,6 +297,7 @@ int ingest_run(int argc, char **argv, const struct ingest_adapter *ad,
 			ds_value_t values[DS_MAX_ATTRS];
 			int n_lists = 0;
 
+			double t0 = now_s();
 			ds_expected(&ds, comp, seq, values);
 			if (ds.n_lists) {
 				n_lists = ds_expected_lists(&ds, comp, ds_job_id(&ds, seq),
@@ -255,44 +310,66 @@ int ingest_run(int argc, char **argv, const struct ingest_adapter *ad,
 					goto out;
 				}
 			}
+			double t1 = now_s();
 			if (ad->write(ctx, comp, seq, values, list_recs, n_lists)) {
-				errors++;
-				if (errors <= MAX_ERRORS_SHOWN)
+				r.errors++;
+				if (r.errors <= MAX_ERRORS_SHOWN)
 					fprintf(stderr, "error: %s adapter: record %" PRIu64
 						" (%" PRIu64 ", %" PRIu64 ") failed\n",
 						ad->name, done, comp, seq);
 			} else {
-				records++;
-				list_entries += n_lists;
+				r.records++;
+				r.list_entries += n_lists;
 			}
+			double t2 = now_s();
+			double g = t1 - t0, w = t2 - t1;
+			r.generate_s += g;
+			r.write_call_s += w;
+			if (g > r.generate_max)
+				r.generate_max = g;
+			if (w > r.write_max)
+				r.write_max = w;
+			hist_add(r.generate_hist, g);
+			hist_add(r.write_hist, w);
 			done++;
 			if (o.batch && ++in_batch >= o.batch) {
+				double t3 = now_s();
 				if (ad->commit(ctx)) {
 					fprintf(stderr, "error: %s adapter: commit failed\n", ad->name);
 					goto out;
 				}
-				if (add_checkpoint(&cps, now_s() - t_write, done))
+				double t4 = now_s();
+				r.commit_s += t4 - t3;
+				if (add_checkpoint(&cps, t4 - t_loop, r.generate_s,
+						   r.write_call_s + r.commit_s, done))
 					goto nomem;
 				in_batch = 0;
 			}
 			if (o.rate > 0) {
-				double wait = t_write + done / o.rate - now_s();
+				double wait = t_loop + done / o.rate - now_s();
 				if (wait > 0) {
 					struct timespec ts = {
 						.tv_sec = (time_t)wait,
 						.tv_nsec = (long)((wait - (time_t)wait) * 1e9)
 					};
+					double t5 = now_s();
 					nanosleep(&ts, NULL);
+					r.throttle_s += now_s() - t5;
 				}
 			}
 		}
 	}
+	double t3 = now_s();
 	if (ad->commit(ctx)) {
 		fprintf(stderr, "error: %s adapter: commit failed\n", ad->name);
 		goto out;
 	}
-	write_s = now_s() - t_write;
-	if (cps.v[cps.n - 1].n != done && add_checkpoint(&cps, write_s, done))
+	double t4 = now_s();
+	r.commit_s += t4 - t3;
+	r.loop_s = t4 - t_loop;
+	r.end_epoch = now_epoch_s();
+	if (cps.v[cps.n - 1].n != done &&
+	    add_checkpoint(&cps, r.loop_s, r.generate_s, r.write_call_s + r.commit_s, done))
 		goto nomem;
 
 	t = now_s();
@@ -300,21 +377,21 @@ int ingest_run(int argc, char **argv, const struct ingest_adapter *ad,
 		fprintf(stderr, "error: %s adapter: sync failed\n", ad->name);
 		goto out;
 	}
-	sync_s = now_s() - t;
+	r.sync_s = now_s() - t;
 
 	t = now_s();
 	if (ad->close && ad->close(ctx)) {
 		fprintf(stderr, "error: %s adapter: close failed\n", ad->name);
 		goto out;
 	}
-	close_s = now_s() - t;
+	r.close_s = now_s() - t;
 
-	if (save(ad, ctx, &o, records, list_entries, errors, start_epoch,
-		 open_s, write_s, sync_s, close_s, &cps))
+	if (save(ad, ctx, &o, &r, &cps))
 		goto out;
-	printf("ingest: %" PRIu64 " records, write %.2fs, sync %.2fs, %" PRIu64
-	       " errors -> %s\n", records, write_s, sync_s, errors, o.output);
-	status = errors ? 1 : 0;
+	printf("ingest: %" PRIu64 " records, generate %.2fs, write %.2fs, sync %.2fs, %"
+	       PRIu64 " errors -> %s\n", r.records, r.generate_s,
+	       r.write_call_s + r.commit_s, r.sync_s, r.errors, o.output);
+	status = r.errors ? 1 : 0;
 	goto out;
 nomem:
 	fprintf(stderr, "error: out of memory recording checkpoints\n");

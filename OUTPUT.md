@@ -93,15 +93,30 @@ computed in the core so that every backend is summarized the same way.
       "batch":                 100,
       "rate":                  0,
       "open_s":                0.01,
+      "loop_s":                2.10,
+      "generate_s":            0.81,
       "write_s":               1.23,
+      "write_call_s":          0.90,
+      "commit_s":              0.33,
+      "throttle_s":            0,
+      "other_s":               0.06,
       "sync_s":                0.45,
       "close_s":               0.02,
+      "timer_cost_ns":         26,
       "durability":            "sos_container_commit(SOS_COMMIT_SYNC)",
       "records_per_s":         65040,
       "durable_records_per_s": 47619,
+      "delivered_records_per_s": 38095,
+      "generate_records_per_s": 98765,
       "window_records":        100,
       "latency_s":      { "n": 800, "min": ..., "p50": ..., "p90": ..., "p95": ..., "p99": ..., "max": ..., "mean": ..., "stddev": ... },
-      "throughput_per_s": { "n": 800, "min": ..., "p50": ..., ... }
+      "throughput_per_s": { "n": 800, "min": ..., "p50": ..., ... },
+      "wall_latency_s": { ... },  "wall_throughput_per_s": { ... },
+      "generate_latency_s": { ... },
+      "record_latency_s": {
+        "generate": { "n": 80000, "p50": ..., "p90": ..., "p95": ..., "p99": ..., "max": ..., "resolution": "log2 buckets" },
+        "write":    { "n": 80000, "p50": ..., ... }
+      }
     }
   ],
   "summary": {
@@ -110,15 +125,22 @@ computed in the core so that every backend is summarized the same way.
     "total_list_entries":     0,
     "errors":                 0,
     "wall_basis":             "wall-clock",
-    "write_wall_s":           1.31,
-    "durable_wall_s":         1.76,
-    "records_per_s":          122137,
-    "durable_records_per_s":  90909,
+    "store_s":                1.26,
+    "durable_store_s":        1.71,
+    "store_records_per_s":    126984,
+    "durable_store_records_per_s": 93567,
+    "wall_s":                 2.15,
+    "durable_wall_s":         2.60,
+    "wall_records_per_s":     74418,
+    "durable_wall_records_per_s": 61538,
     "host_records_per_s_min": 64000,
     "host_records_per_s_max": 65040,
     "host_imbalance":         1.02,
     "latency_s":              { ... },
-    "throughput_per_s":       { ... }
+    "throughput_per_s":       { ... },
+    "wall_latency_s":         { ... },
+    "wall_throughput_per_s":  { ... },
+    "generate_latency_s":     { ... }
   }
 }
 ```
@@ -133,15 +155,26 @@ computed in the core so that every backend is summarized the same way.
 | `batch` | the batch size setting |
 | `rate` | the rate setting |
 | `open_s` | one-time setup: connect, open the container, schemas |
-| `write_s` | first record → last commit returned (generation included) |
+| `loop_s` | wall time of the whole loop: first record → last commit returned |
+| `generate_s` | generating the records, summed over records |
+| `write_s` | the store: `write_call_s + commit_s` (generation excluded) |
+| `write_call_s` | the adapter's `write()` calls, summed over records |
+| `commit_s` | the adapter's `commit()` calls, summed over batches |
+| `throttle_s` | time slept to hold `--rate` |
+| `other_s` | `loop_s − generate_s − write_s − throttle_s`: loop bookkeeping, garbage collection, preemption |
 | `sync_s` | making the data durable and visible (0 if there is no such step) |
 | `close_s` | teardown; part of no rate |
+| `timer_cost_ns` | cost of one clock read on this host; every timed interval includes about one |
 | `durability` | what `sync_s` guarantees for this backend, declared by the adapter |
-| `records_per_s` | `records / write_s` |
+| `records_per_s` | `records / write_s`: the store's capacity |
 | `durable_records_per_s` | `records / (write_s + sync_s)` |
+| `delivered_records_per_s` | `records / loop_s`: what the whole loop delivered, generation and throttling included |
+| `generate_records_per_s` | `records / generate_s`: how fast the harness produced them |
 | `window_records` | records per batch window (`batch`, or `records` if batch is 0) |
-| `latency_s` | nine-number summary of per-window durations (seconds) |
-| `throughput_per_s` | nine-number summary of per-window throughput (records/s) |
+| `latency_s`, `throughput_per_s` | nine-number summary of per-window store durations (seconds) and throughput (records/s) |
+| `wall_latency_s`, `wall_throughput_per_s` | the same windows measured in wall time: generation and throttling included, so under `--rate` this is the delivered rate |
+| `generate_latency_s` | the same windows measured in generation time |
+| `record_latency_s` | per-record `generate` and `write` (one `write()` call) durations: `n`, `p50`–`p99` and the exact `max`. Percentiles come from log2 histograms and are accurate to a factor of about 1.4 |
 
 #### Summary fields
 
@@ -151,16 +184,20 @@ computed in the core so that every backend is summarized the same way.
 | `total_records` | sum of all hosts' records |
 | `total_list_entries` | sum of all hosts' list entries |
 | `errors` | sum of all hosts' errors |
-| `wall_basis` | `"wall-clock"` (from host start-epoch timestamps) or `"slowest-host"` (fallback when start epochs are missing) |
-| `write_wall_s` | wall-clock elapsed time for the write phase |
-| `durable_wall_s` | wall-clock elapsed time including sync |
-| `records_per_s` | `total_records / write_wall_s` |
-| `durable_records_per_s` | `total_records / durable_wall_s` |
+| `wall_basis` | `"wall-clock"` (from the hosts' start and end timestamps) or `"slowest-host"` (fallback when they are missing) |
+| `store_s` | the slowest host's `write_s`; hosts' start times do not matter |
+| `durable_store_s` | the slowest host's `write_s + sync_s` |
+| `store_records_per_s` | `total_records / store_s`: the store's capacity over all hosts |
+| `durable_store_records_per_s` | `total_records / durable_store_s` |
+| `wall_s` | observed elapsed time: earliest loop start → latest loop end (generation and throttling included) |
+| `durable_wall_s` | the same, with each host's `sync_s` added to its end |
+| `wall_records_per_s` | `total_records / wall_s`: what the run delivered |
+| `durable_wall_records_per_s` | `total_records / durable_wall_s` |
 | `host_records_per_s_min` | slowest host's `records_per_s` |
 | `host_records_per_s_max` | fastest host's `records_per_s` |
 | `host_imbalance` | `max / min` host rate (null when no host reported a rate) |
-| `latency_s` | nine-number summary of all hosts' windows pooled |
-| `throughput_per_s` | nine-number summary of all hosts' windows pooled |
+| `latency_s`, `throughput_per_s` | nine-number summary of all hosts' store windows pooled |
+| `wall_latency_s`, `wall_throughput_per_s`, `generate_latency_s` | the same, for wall-time and generation-time windows |
 
 The pooled latency/throughput series hold every host's windows together:
 they describe the rate each server achieved over a window, not a sum
@@ -338,14 +375,27 @@ write loop, batching and throttling, and writes the raw result file
 adapter only calls its storage API. Every backend is therefore timed by the
 same code, the way queries are timed by `core/egress.py`.
 
-The engine times four phases, in this order:
+The engine times four phases, in this order, and splits the write phase
+into what the harness does and what the backend does:
 
 | Field | What it covers |
 |---|---|
 | `open_s` | one-time setup: connect, open or create the container, add schemas |
-| `write_s` | first record → the last `commit()` returns (record generation is included) |
+| `generate_s` | generating the records, summed over records (the harness) |
+| `write_s` | the store: `write_call_s` (the adapter's `write()` calls, summed over records) plus `commit_s` (its `commit()` calls, summed over batches) |
 | `sync_s` | `adapter.sync()`: making the data durable and visible to readers (`0` if the backend has no such step) |
 | `close_s` | teardown only; reported, but part of no rate |
+| `loop_s`, `throttle_s` | wall time of the whole loop, and the time slept to hold `--rate` |
+
+Generation and the store are timed record by record, with one clock read
+before and after each, so generation is not part of `write_s` and the engine
+holds nothing beyond the current record, whatever the data set or batch size.
+Per record the engine adds three clock reads and a histogram update, under 1 µs
+(about 0.5% of a Python record; the measured difference from reading the clock
+only once per batch was within noise). `timer_cost_ns` records what one clock
+read costs on the host, and the summary warns when it exceeds 1 µs. Time spent
+outside the timed intervals (loop bookkeeping, garbage collection, preemption)
+is `other_s`.
 
 An adapter's `commit()` returns only after the backend has acknowledged the
 batch, and nothing needed for completeness is left to `close()`. The raw file
@@ -353,61 +403,69 @@ also holds a `durability` string, declared by the adapter, saying what
 `sync_s` guarantees for that backend (for example `os.sync()` for the SOS
 Python adapter), so the durable figures can be read for what they are.
 
-The summary derives `records_per_s = records / write_s` and
-`durable_records_per_s = records / (write_s + sync_s)`.
+Several rates are derived, each answering a different question:
 
-Additionally, the raw file holds a list of checkpoints: `[[seconds, samples], ...]`,
-one entry at the end of every batch (after its commit completed) and a
-final entry when the write finished. `core/stats.py` uses these to compute
-per-batch-window latency and throughput distributions (see the ingest
-section above).
+| Rate | Calculation | Question it answers |
+|---|---|---|
+| `records_per_s` | `records / write_s` | how fast does the store absorb records when fed instantly |
+| `durable_records_per_s` | `records / (write_s + sync_s)` | the same, once the data is durable |
+| `delivered_records_per_s` | `records / loop_s` | what the whole loop delivered; under `--rate` this is the paced rate |
+| `generate_records_per_s` | `records / generate_s` | how fast the harness produces records on this engine |
 
-#### Measuring the harness floor
+Because the generator and the backend run one after the other here,
+`records_per_s` is an upper bound on a sustained run. A backend that keeps
+working in the background (SOS, OS write-back, a client that flushes on a
+thread) overlaps with generation in a real pipeline, so its store time is
+shorter than the delivered time suggests; compare `records_per_s` with
+`delivered_records_per_s` to see that.
 
-A backend's `write_s` includes work that is not the backend's: the engine
-generates every record inside the write phase and runs the loop. The null
-adapter stores nothing, so its `write_s` is that work alone, the floor under
-every backend's `write_s`. There is one null adapter per engine, and a
-backend is compared with the engine it runs on, because the two engines
-generate at very different speeds (Python about 130-200 µs per record, C a
-few µs).
+Additionally, the raw file holds a list of checkpoints, one per batch (after
+its commit completed) and a final one when the write finished. Each row is
+`[wall_s, generate_s, write_s, samples]`: seconds since the loop began, the
+generation and store time so far, and the samples done. `core/stats.py`
+derives three window distributions from them: the store windows
+(`latency_s`, `throughput_per_s`), the wall windows (what was delivered) and
+the generation windows. The raw file also holds log2 histograms of the
+per-record generation and `write()` durations (`generate_hist`,
+`write_hist`) and their exact maxima, from which the summary reports
+`record_latency_s`.
 
-Run the null adapter on the same host, with the same data set, `--components`,
-`--samples` and `--batch` as the run being explained, and unthrottled
-(`--rate 0`):
+#### Reading the harness's own cost
+
+`generate_s` is measured in every run, so the generation share is always
+visible: `generate_s / loop_s`, or `generate_records_per_s` against
+`records_per_s`. No separate run is needed, and a Python adapter's `write_s`
+no longer includes it.
+
+The null adapter stores nothing, so what it reports is the cost of the
+measurement itself: its `write_s` and its `write` histogram are the floor for
+one adapter call plus the timing around it, and its `generate_s` is the
+generation cost on that engine. Run it with the same data set and parameters
+on the same host to compare engines or to subtract that floor from an
+adapter's `write_call_s`:
 
 ```bash
-# Python engine (the floor for sos_write.py, dsos_write.py, influx_write.py)
+# Python engine
 DATASET=dataset/default.json python3 core/ingest.py --backend null --adapter null \
     --writer null --output /tmp/floor-py.json --node-index 0 \
     --components 16 --samples 5000 --batch 500
 
-# C engine (the floor for sos_write)
+# C engine
 make -C core ingest_null
 DATASET=dataset/default.json core/ingest_null \
     --writer null --output /tmp/floor-c.json --node-index 0 \
     --components 16 --samples 5000 --batch 500
 ```
 
-Then, from each raw file:
-
 | Quantity | Calculation |
 |---|---|
-| Floor rate | `records / write_s` of the null run |
-| Storage time of a backend run | `write_s` of the backend run − `write_s` of the null run on the same engine |
-| Share of the backend's `write_s` that is harness | `write_s` (null) / `write_s` (backend) |
-| Storage-only rate | `records / (write_s (backend) − write_s (null))` |
+| Generation cost per record on an engine | `generate_s / records` of the null run |
+| Floor per adapter call | `write_call_s / records` of the null run (about one clock read plus a method call) |
+| An adapter's own work per record | `write_call_s / records` of its run, minus the floor |
 
-Notes on reading the result:
-- Generation is deterministic, so the null run costs the same every time;
-  repeat it and take the median, since it still varies with the host's load.
-- The subtraction is an estimate. It leaves in what the adapter itself does to
-  turn a record into the backend's format (for example building line
-  protocol), which is the adapter's cost and belongs to the backend.
-- Never compare a Python adapter's `write_s` with the C null run, or the
-  reverse.
-- This is a stopgap for measuring generation: a later change will time
-  generation separately inside the engine and report it directly.
+Run it a few times and take the median; the host's load moves it. Never compare
+a Python adapter with the C null run, or the reverse: the engines generate at
+very different speeds (Python about 120–200 µs per record, C a few µs).
 
 `QUERY_ADAPTER=null` does the same for egress in `query` mode: it returns no
 rows, so it measures only the timing loop (`check` mode fails with it, as

@@ -7,11 +7,12 @@
  * see its docstring). An adapter only calls its backend's API; it implements
  * no loop, clock, checkpoint or JSON code.
  *
- * Phases, timed by the engine, in this order:
+ * Phases and costs, timed by the engine (record by record for generation and
+ * write; see core/ingest.py's docstring for every raw field):
  *
  *   open_s   adapter->open()
- *   write_s  first adapter->write() -> the last adapter->commit() returns
- *            (record generation included)
+ *   write_s  the adapter->write() calls plus the adapter->commit() calls
+ *            (record generation is timed apart, as generate_s)
  *   sync_s   adapter->sync()   make the data durable and visible
  *   close_s  adapter->close()  teardown only
  *

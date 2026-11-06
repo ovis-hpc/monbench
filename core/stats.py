@@ -16,22 +16,16 @@ A percentile is reported only when the series has enough samples for it to
 be more than the maximum (see min_samples()); otherwise it is null.
 
 Raw ingest output (one JSON file per server host, written by core/ingest.py;
-see its docstring):
+its docstring lists every field): counts, phase timers, per-record generation
+and write() histograms, and checkpoints. A checkpoint row is
+[wall_s, generate_s, write_s, samples]: seconds since the loop began, and the
+generation and store time so far, at the end of every batch (after its commit
+returned), beginning with an all-zero row. The three time columns give three
+views of the same batches:
 
-    records         node records written
-    list_entries    list-attribute entries written (0 without list attributes)
-    errors          samples that failed to write
-    batch, rate     the run's own settings, echoed
-    start_epoch_s   wall-clock time at which the write phase began
-    open_s          one-time setup: connect, open the container, schemas
-    write_s         first record -> last commit returned (generation included)
-    sync_s          making the data durable and visible (0 if no such step)
-    close_s         teardown; reported, not part of any rate
-    durability      what sync_s guarantees for this backend
-    checkpoints     [[seconds since write start, samples done so far], ...]
-                    beginning with [0, 0], one entry at the end of every batch
-                    (after its commit returned) and a last one when the write
-                    finished
+    store     write_s     what the backend needed (capacity)
+    wall      wall_s      what was delivered, generation and throttling included
+    generate  generate_s  what the harness spent producing the records
 
 A batch is the unit of work: `batch` node records committed or sent
 together. Each interval between two checkpoints is therefore one batch (a
@@ -108,23 +102,58 @@ def rate(count, seconds):
 # ----------------------------------------------------------------- ingest
 
 
-def windows(checkpoints, batch=0):
-    """Intervals between consecutive checkpoints as (seconds, records).
+WALL, GENERATE, STORE = 0, 1, 2          # checkpoint time columns
+SAMPLES = 3
 
-    Intervals with no elapsed time or no records are dropped. When *batch*
+
+def windows(checkpoints, batch=0, col=STORE):
+    """Intervals between consecutive checkpoints as (seconds, samples), the
+    seconds taken from time column *col* (WALL, GENERATE or STORE).
+
+    Intervals with no elapsed time or no samples are dropped. When *batch*
     (the run's batch size) is given, so is any interval with fewer
-    records than that: a final partial batch would only add noise to a
+    samples than that: a final partial batch would only add noise to a
     distribution of equally sized windows.
     """
     out = []
     prev = None
-    for t, n in checkpoints:
+    for row in checkpoints:
         if prev is not None:
-            dt, dn = t - prev[0], n - prev[1]
+            dt, dn = row[col] - prev[col], row[SAMPLES] - prev[SAMPLES]
             if dt > 0 and dn > 0 and (not batch or dn >= batch):
                 out.append((dt, dn))
-        prev = (t, n)
+        prev = row
     return out
+
+
+def hist_summary(hist, maximum=None):
+    """Summary of a log2 histogram of durations (see core/ingest.py).
+
+    Bucket b holds durations of [2^(b-1), 2^b) ns; a percentile is reported
+    as the geometric middle of its bucket, so it is accurate to within a
+    factor of about 1.4. *maximum* is the exact longest duration. Percentiles
+    follow the same minimum-sample rule as summarize().
+    """
+    n = sum(hist or [])
+    out = {"n": n, "p50": None, "p90": None, "p95": None, "p99": None,
+           "max": maximum, "resolution": "log2 buckets"}
+    if n == 0:
+        return out
+    for p in (50, 90, 95, 99):
+        if n < min_samples(p):
+            continue
+        need, seen = n * p / 100.0, 0
+        for b, count in enumerate(hist):
+            seen += count
+            if seen >= need:
+                out[f"p{p}"] = 0.0 if b == 0 else round(2.0 ** (b - 0.5) * 1e-9, 12)
+                break
+    return out
+
+
+def _series(raw, col, batch):
+    wins = windows(raw.get("checkpoints") or [], batch, col)
+    return summarize(dt for dt, _ in wins), summarize(dn / dt for dt, dn in wins)
 
 
 def ingest_host(raw):
@@ -132,9 +161,17 @@ def ingest_host(raw):
     records = raw.get("records")
     write_s = raw.get("write_s")
     sync_s = raw.get("sync_s") or 0.0
+    loop_s = raw.get("loop_s")
+    generate_s = raw.get("generate_s")
+    throttle_s = raw.get("throttle_s") or 0.0
     batch = int(raw.get("batch") or 0)
-    wins = windows(raw.get("checkpoints") or [], batch)
     durable_s = write_s + sync_s if write_s is not None else None
+    other_s = None
+    if None not in (loop_s, generate_s, write_s):
+        other_s = loop_s - generate_s - write_s - throttle_s
+    latency, throughput = _series(raw, STORE, batch)
+    wall_latency, wall_throughput = _series(raw, WALL, batch)
+    generate_latency, generate_throughput = _series(raw, GENERATE, batch)
     return {
         "records": records,
         "list_entries": raw.get("list_entries", 0),
@@ -142,24 +179,45 @@ def ingest_host(raw):
         "batch": raw.get("batch"),
         "rate": raw.get("rate"),
         "open_s": raw.get("open_s"),
+        "loop_s": loop_s,
+        "generate_s": generate_s,
         "write_s": write_s,
+        "write_call_s": raw.get("write_call_s"),
+        "commit_s": raw.get("commit_s"),
+        "throttle_s": throttle_s,
+        "other_s": _r(other_s),
         "sync_s": sync_s,
         "close_s": raw.get("close_s"),
+        "timer_cost_ns": raw.get("timer_cost_ns"),
         "records_per_s": _r(rate(records, write_s)),
         "durable_records_per_s": _r(rate(records, durable_s)),
+        "delivered_records_per_s": _r(rate(records, loop_s)),
+        "generate_records_per_s": _r(rate(records, generate_s)),
         "window_records": batch or records,
-        "latency_s": summarize(dt for dt, _ in wins),
-        "throughput_per_s": summarize(dn / dt for dt, dn in wins),
+        "latency_s": latency,
+        "throughput_per_s": throughput,
+        "wall_latency_s": wall_latency,
+        "wall_throughput_per_s": wall_throughput,
+        "generate_latency_s": generate_latency,
+        "record_latency_s": {
+            "generate": hist_summary(raw.get("generate_hist"), raw.get("generate_max_s")),
+            "write": hist_summary(raw.get("write_hist"), raw.get("write_call_max_s")),
+        },
     }
 
 
 def ingest_summary(raws):
     """Statistics across all ingest runs of one write phase.
 
-    Wall time is measured from the earliest write start to the latest write
-    end using the hosts' wall clocks (so it assumes they are synchronized);
-    if any host did not report a start time it falls back to the slowest
-    host's own elapsed time.
+    Two aggregate views, both over all hosts:
+      store   the backend's capacity: total records over the slowest host's
+              store time (write_s, or write_s + sync_s for durable). A host's
+              rate does not depend on when it started, so no clock is shared.
+      wall    what was delivered: total records over the interval from the
+              earliest loop start to the latest loop end, using the hosts'
+              wall clocks (so it assumes they are synchronized). If a host
+              did not report its start and end it falls back to the slowest
+              host's own loop time.
 
     The pooled latency/throughput series hold every host's windows
     together: they describe the rate each server achieved over a window,
@@ -168,37 +226,54 @@ def ingest_summary(raws):
     hosts = [ingest_host(r) for r in raws]
     total = sum(h["records"] for h in hosts)
     starts = [r.get("start_epoch_s") for r in raws]
+    ends = [r.get("end_epoch_s") for r in raws]
     sync = [h["sync_s"] for h in hosts]
-    if all(isinstance(s, (int, float)) for s in starts):
+    store_s = max(h["write_s"] for h in hosts)
+    durable_store_s = max(h["write_s"] + y for h, y in zip(hosts, sync))
+    if all(isinstance(x, (int, float)) for x in starts + ends):
         basis = "wall-clock"
         t0 = min(starts)
-        write_wall = max(s + h["write_s"] for s, h in zip(starts, hosts)) - t0
-        durable_wall = max(s + h["write_s"] + y
-                           for s, h, y in zip(starts, hosts, sync)) - t0
+        wall_s = max(ends) - t0
+        durable_wall_s = max(e + y for e, y in zip(ends, sync)) - t0
     else:
         basis = "slowest-host"
-        write_wall = max(h["write_s"] for h in hosts)
-        durable_wall = max(h["write_s"] + y for h, y in zip(hosts, sync))
+        wall_s = max(h["loop_s"] or h["write_s"] for h in hosts)
+        durable_wall_s = max((h["loop_s"] or h["write_s"]) + y
+                             for h, y in zip(hosts, sync))
     host_rates = [h["records_per_s"] for h in hosts if h["records_per_s"]]
-    wins = [w for r in raws
-            for w in windows(r.get("checkpoints") or [],
-                             int(r.get("batch") or 0))]
+
+    def pooled(col):
+        wins = [w for r in raws
+                for w in windows(r.get("checkpoints") or [], int(r.get("batch") or 0), col)]
+        return (summarize(dt for dt, _ in wins),
+                summarize(dn / dt for dt, dn in wins))
+
+    latency, throughput = pooled(STORE)
+    wall_latency, wall_throughput = pooled(WALL)
+    generate_latency, _ = pooled(GENERATE)
     return {
         "hosts": len(hosts),
         "total_records": total,
         "total_list_entries": sum(h["list_entries"] for h in hosts),
         "errors": sum(h["errors"] for h in hosts),
         "wall_basis": basis,
-        "write_wall_s": _r(write_wall),
-        "durable_wall_s": _r(durable_wall),
-        "records_per_s": _r(rate(total, write_wall)),
-        "durable_records_per_s": _r(rate(total, durable_wall)),
+        "store_s": _r(store_s),
+        "durable_store_s": _r(durable_store_s),
+        "store_records_per_s": _r(rate(total, store_s)),
+        "durable_store_records_per_s": _r(rate(total, durable_store_s)),
+        "wall_s": _r(wall_s),
+        "durable_wall_s": _r(durable_wall_s),
+        "wall_records_per_s": _r(rate(total, wall_s)),
+        "durable_wall_records_per_s": _r(rate(total, durable_wall_s)),
         "host_records_per_s_min": _r(min(host_rates)) if host_rates else None,
         "host_records_per_s_max": _r(max(host_rates)) if host_rates else None,
         "host_imbalance": (_r(max(host_rates) / min(host_rates))
                            if host_rates else None),
-        "latency_s": summarize(dt for dt, _ in wins),
-        "throughput_per_s": summarize(dn / dt for dt, dn in wins),
+        "latency_s": latency,
+        "throughput_per_s": throughput,
+        "wall_latency_s": wall_latency,
+        "wall_throughput_per_s": wall_throughput,
+        "generate_latency_s": generate_latency,
     }, hosts
 
 

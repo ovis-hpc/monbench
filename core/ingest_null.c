@@ -1,7 +1,8 @@
 /*
  * ingest_null -- C ingest adapter that stores nothing. It measures the C
- * ingest engine itself (record generation and the loop): the floor under
- * every other C adapter's figures. Build with 'make -C core ingest_null'.
+ * ingest engine's own cost (record generation, the loop and the timing
+ * around each adapter call): the floor under every other C adapter's
+ * figures. Build with 'make -C core ingest_null'.
  */
 #include "ingest.h"
 

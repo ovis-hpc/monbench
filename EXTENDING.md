@@ -93,14 +93,14 @@ DEFAULT_ADAPTER = "<adapter-name>"
 | `close()` | No | Teardown only. Nothing needed for completeness may be left to `close()` |
 | `info()` | No | Extra fields for the raw result (`target`, storage kind, ...) |
 
-The class also declares `durability`, a few words saying what `sync()` guarantees. The engine times four phases — `open`, `write` (first `write()` until the last `commit()` returns, record generation included), `sync` and `close` — so an adapter implements no timing, checkpoints or result format. The same rules fit any storage technology: connect and discover in `open`; `commit` is the acknowledgement barrier; `sync` covers durability and visibility lag; `close` is teardown.
+The class also declares `durability`, a few words saying what `sync()` guarantees. The engine generates each record and times that apart from the adapter, then times the phases `open`, `write` (the adapter's `write()` calls and its `commit()` calls), `sync` and `close`, so an adapter implements no timing, checkpoints or result format and its `write_s` never includes generation. The same rules fit any storage technology: connect and discover in `open`; `commit` is the acknowledgement barrier; `sync` covers durability and visibility lag; `close` is teardown.
 
-A C adapter does the same through `core/ingest.h`: it fills in a `struct ingest_adapter` of callbacks and calls `ingest_run()`; `backends/sos/writer/sos_write.c` is the worked example. Both engines have an adapter that stores nothing, to measure the harness itself: `--adapter null` for `core/ingest.py`, and `core/ingest_null.c` (`make -C core ingest_null`) for the C engine. Their `write_s` is the floor under every backend's `write_s` on the same engine; `OUTPUT.md`, "Measuring the harness floor", shows how to run them and subtract.
+A C adapter does the same through `core/ingest.h`: it fills in a `struct ingest_adapter` of callbacks and calls `ingest_run()`; `backends/sos/writer/sos_write.c` is the worked example. Both engines have an adapter that stores nothing, to measure the harness itself: `--adapter null` for `core/ingest.py`, and `core/ingest_null.c` (`make -C core ingest_null`) for the C engine. Their figures are the cost of the measurement itself on that engine; `OUTPUT.md`, "Reading the harness's own cost", shows how to run them and what to subtract.
 
-The engine saves one raw JSON file per host, `results/ingest-<writer>-<host>-raw.json` (the path comes from `--output`). It carries **raw inputs only**: counts, phase timers and progress checkpoints; `core/stats.py` derives every rate and percentile, the same way for every backend. For example:
+The engine saves one raw JSON file per host, `results/ingest-<writer>-<host>-raw.json` (the path comes from `--output`). It carries **raw inputs only**: counts, timers, histograms and progress checkpoints; `core/stats.py` derives every rate and percentile, the same way for every backend. For example:
 
 ```json
-{"writer": "influx", "backend": "influxdb/python", "adapter": "influx", "durability": "none (server acknowledges the write)", "node_index": 0, "records": 80000, "list_entries": 0, "errors": 0, "batch": 500, "rate": 0.0, "start_epoch_s": 1767225600.123456, "open_s": 0.002, "write_s": 7.73, "sync_s": 0.0, "close_s": 0.001, "measurement": "monitoring", "checkpoints": [[0.0, 0], [0.048, 500], [0.097, 1000], ..., [7.73, 80000]]}
+{"writer": "influx", "backend": "influxdb/python", "adapter": "influx", "durability": "none (server acknowledges the write)", "node_index": 0, "records": 80000, "list_entries": 0, "errors": 0, "batch": 500, "rate": 0.0, "start_epoch_s": 1767225600.123456, "end_epoch_s": 1767225620.5, "open_s": 0.002, "loop_s": 20.37, "generate_s": 12.6, "write_s": 7.73, "write_call_s": 0.8, "commit_s": 6.93, "throttle_s": 0.0, "sync_s": 0.0, "close_s": 0.001, "timer_cost_ns": 48.2, "generate_max_s": 0.0009, "write_call_max_s": 0.0004, "generate_hist": [...], "write_hist": [...], "measurement": "monitoring", "checkpoint_fields": ["wall_s", "generate_s", "write_s", "samples"], "checkpoints": [[0.0, 0.0, 0.0, 0], [0.078, 0.063, 0.048, 500], ..., [20.37, 12.6, 7.73, 80000]]}
 ```
 
 | Field | Meaning |
@@ -109,15 +109,22 @@ The engine saves one raw JSON file per host, `results/ingest-<writer>-<host>-raw
 | `list_entries` | List-attribute entries written; 0 for a dataset without list attributes |
 | `errors` | Samples whose `write()` raised |
 | `batch`, `rate` | The `--batch` and `--rate` the run used, echoed |
-| `start_epoch_s` | Wall-clock time (Unix seconds) at which the write phase began; lets the core place the hosts' writes on one time line |
+| `start_epoch_s`, `end_epoch_s` | Wall-clock time (Unix seconds) at which the loop began and ended; lets the core place the hosts on one time line |
 | `open_s` | One-time setup |
-| `write_s` | First record until the last commit returned |
+| `loop_s` | Wall time of the loop: first record until the last commit returned |
+| `generate_s` | Generating the records, summed over records |
+| `write_s` | The store: `write_call_s + commit_s` |
+| `write_call_s`, `commit_s` | The adapter's `write()` calls summed over records, and its `commit()` calls summed over batches |
+| `throttle_s` | Time slept to hold `--rate` |
 | `sync_s` | Making the data durable and visible; `0` if the backend has no such step |
 | `close_s` | Teardown; reported, part of no rate |
+| `timer_cost_ns` | Cost of one clock read on the host |
+| `generate_max_s`, `write_call_max_s` | The longest single generation and `write()` call |
+| `generate_hist`, `write_hist` | Log2 histograms of the per-record generation and `write()` durations (bucket `b` counts `[2^(b-1), 2^b)` ns) |
 | `durability` | What `sync_s` guarantees, declared by the adapter |
-| `checkpoints` | `[[seconds since the write began, samples done so far], ...]`, starting with `[0, 0]`, one entry after every batch's commit and a final one when the write finishes |
+| `checkpoint_fields`, `checkpoints` | One row per batch after its commit, and a final one: seconds since the loop began, generation and store time so far, samples done; starting with an all-zero row |
 
-The core turns each interval between two checkpoints into one sample (its duration is the batch's latency; records divided by duration is its throughput) and reports the same summary for every backend: `n`, `min`, `p50`, `p90`, `p95`, `p99`, `max`, `mean`, `stddev`. Nothing assumes a data set size, a batch size or a host count. A trailing batch smaller than `--batch` is left out of the distributions (it is still part of the totals).
+The core turns each interval between two checkpoints into one sample, measured in store time, in wall time and in generation time (the store duration is the batch's latency; records divided by duration is its throughput) and reports the same summary for every backend: `n`, `min`, `p50`, `p90`, `p95`, `p99`, `max`, `mean`, `stddev`. Nothing assumes a data set size, a batch size or a host count. A trailing batch smaller than `--batch` is left out of the distributions (it is still part of the totals).
 
 ### Plugin meta files
 
