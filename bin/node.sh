@@ -125,7 +125,7 @@ cmd_write() { # WRITER MODE INDEX ID
 	# keyed by the writer name; the plugin_write hook is responsible for
 	# naming the storage target.
 	mkdir -p "${OUTPUT_DIR}/results"
-	out="${OUTPUT_DIR}/results/write-${writer}-${HOST}.json"
+	out="${OUTPUT_DIR}/results/ingest-${writer}-${HOST}-raw.json"
 	local rc=0
 	# With pipefail, the pipeline fails when the writer fails.
 	hook write "$@" | tee "$out.tmp" || rc=1

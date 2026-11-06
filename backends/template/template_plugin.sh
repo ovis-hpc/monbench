@@ -46,7 +46,7 @@ plugin_write() { # WRITER MODE INDEX SERVER_ID
 	# backends/README.md.
 	#
 	# The plugin constructs its own target name using ds_name() and records
-	# it in a storage meta file for the query engine. See EXTENDING.md,
+	# it in an ingest-handoff meta file for the query engine. See EXTENDING.md,
 	# "Plugin meta files".
 	#
 	# Route the actual writer invocation through run_logged so -d reports
@@ -55,8 +55,8 @@ plugin_write() { # WRITER MODE INDEX SERVER_ID
 	#   run_logged DATASET="${DATASET}" -- "${PYTHON}" "${PLUGIN_DIR}/writer/<name>_write.py" \
 	#       --target "$target" --node-index "$index" "${dataset_args[@]}"
 	#
-	# After writing, record the storage meta file:
-	#   cat > "${OUTPUT_DIR}/meta/storage-${writer}.json" <<-EOF
+	# After writing, record the ingest-handoff meta file:
+	#   cat > "${OUTPUT_DIR}/meta/ingest-handoff-${writer}.json" <<-EOF
 	#   {"target": "${target}", "backend": "<name>", "data_root": "${OUTPUT_DIR}/nodes/${HOST}/data"}
 	#   EOF
 	die "template backend: plugin_write not implemented (writer ${writer}, target ${target}, partition ${index})"

@@ -51,8 +51,9 @@ so that it verifies against the data actually written, and so that it can
 refuse to query a writer whose data was produced by a different backend.
 
 The backend plugin separately records storage-specific information (the
-target name it chose, paths, database names, etc.) in a storage meta file
-at <OUTPUT_DIR>/meta/storage-<writer>.json. The query engine reads that
+target name it chose, paths, database names, etc.) in an ingest-handoff
+meta file at <OUTPUT_DIR>/meta/ingest-handoff-<writer>.json. The query
+engine reads that
 to discover where the data lives (see core/bench.py's _read_plugin_meta()).
 
 Command line (used by bin/node.sh):

@@ -59,7 +59,7 @@ BENCH_DIR="${BENCH_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 #
 # OUTPUT_DIR/<pair>/ layout:
 #   meta/                 backend-level metadata (shared across nodes)
-#     storage-<w>.json      where writer <w> stored data (plugin→query handoff)
+#     ingest-handoff-<w>.json  where writer <w> stored data (plugin→query handoff)
 #     dataset-<w>.json      dataset params for writer <w> (core-written)
 #   nodes/<hostname>/     per-server scratch (wiped on clean)
 #     data/                 backend storage (containers, databases)
@@ -76,7 +76,7 @@ PYTHON="${PYTHON:-python3}"
 # Data set definition (attributes and keys); see dataset/default.json.
 # The definition's "name" field (DS.name) is the logical data/measurement
 # name -- each backend plugin uses it to construct its own storage paths
-# and records them in storage meta files at meta/storage-<writer>.json.
+# and records them in ingest-handoff meta files at meta/ingest-handoff-<writer>.json.
 DATASET="${DATASET:-${BENCH_DIR}/dataset/default.json}"
 # Writers to run; each writes its own storage target, named by the plugin
 # (typically <DS.name>_<writer>), so they can be compared. Empty selects

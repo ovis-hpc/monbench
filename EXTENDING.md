@@ -27,10 +27,10 @@ The harness runs phases in a fixed order. Each phase calls specific plugin hooks
 1. **`clean`** — the harness stops the services, calls `plugin_clean` on each server, then removes `nodes/<hostname>/` and `meta/` (optional, only when requested; `purge` also removes `results/` and `logs/`)
 2. **`build`** — `plugin_build`: compile writers if needed
 3. **`serve-write`** — `plugin_serve_start`: start the database service (only if `PLUGIN_SERVICE=1`)
-4. **`write`** — `plugin_write`: write each partition of the dataset, one call per server. The plugin also writes a storage meta file recording where it stored the data (see "Plugin meta files" below)
+4. **`write`** — `plugin_write`: write each partition of the dataset, one call per server. The plugin also writes an ingest-handoff meta file recording where it stored the data (see "Plugin meta files" below)
 5. **`meta`** — the harness records dataset parameters to `meta/dataset-<writer>.json`; no plugin hook
 6. **`serve-query`** — `plugin_serve_start` on the query backend (skipped if it is the same as the write backend)
-7. **`query`** — the engine reads the plugin's storage meta file from `meta/storage-<writer>.json` to find the storage target, connects the adapter (`connect()`), loads the query set, and runs each query through `query()` / `count()` / `records()`
+7. **`query`** — the engine reads the plugin's ingest-handoff meta file from `meta/ingest-handoff-<writer>.json` to find the storage target, connects the adapter (`connect()`), loads the query set, and runs each query through `query()` / `count()` / `records()`
 8. **`stop`** — `plugin_serve_stop`: stop the service
 
 A backend that manages its own service externally (`PLUGIN_SERVICE=0`) simply skips the serve and stop phases — the harness calls `plugin_write` and the query adapter directly.
@@ -87,15 +87,15 @@ The writer's summary line is a single JSON object on stdout. It carries **raw in
 
 The core turns each interval between two checkpoints into one sample (its duration is the batch's latency; records divided by duration is its throughput) and reports the same summary for every backend: `n`, `min`, `p50`, `p90`, `p95`, `p99`, `max`, `mean`, `stddev`. Nothing assumes a data set size, a batch size or a host count. A trailing batch smaller than `--batch` is left out of the distributions but kept in the totals, and a percentile is reported only when there are enough batches for it (20 for p95, 100 for p99). See `OUTPUT.md`, "Statistics".
 
-The harness saves the line to `results/write-<writer>-<host>.json`.
+The harness saves the line to `results/ingest-<writer>-<host>-raw.json`.
 
 ### Plugin meta files
 
 Each backend plugin is responsible for constructing its own storage target
 name and recording where and how it stored the data. The plugin writes a
-JSON storage meta file to `meta/storage-<writer>.json` during the write
-phase. The query engine reads this file to find the storage target, rather
-than reconstructing paths by convention.
+JSON ingest-handoff meta file to `meta/ingest-handoff-<writer>.json` during
+the write phase. The query engine reads this file to find the storage
+target, rather than reconstructing paths by convention.
 
 The helper function `ds_name()` (defined in `bin/node.sh`) reads the dataset
 definition's `"name"` field from the `DATASET` JSON file. Use it to construct
@@ -105,7 +105,7 @@ and `"$(ds_name)_live"` for live mode, but the plugin is free to choose.
 The meta file must be valid JSON. Its contents are backend-specific, but it
 should include at least the storage target name. Examples:
 
-**SOS/DSOS** (`meta/storage-c.json`):
+**SOS/DSOS** (`meta/ingest-handoff-c.json`):
 
 ```json
 {
@@ -116,7 +116,7 @@ should include at least the storage target name. Examples:
 }
 ```
 
-**InfluxDB** (`meta/storage-influx.json`):
+**InfluxDB** (`meta/ingest-handoff-influx.json`):
 
 ```json
 {
@@ -162,7 +162,7 @@ here.
 
 | File | Written by | Purpose |
 | --- | --- | --- |
-| `storage-<writer>.json` | plugin (`plugin_write`) | Where writer `<writer>` stored data — the writer→query handoff. Core contract: the query engine reads this to find the storage target (see "Plugin meta files" above) |
+| `ingest-handoff-<writer>.json` | plugin (`plugin_write`) | Where writer `<writer>` stored data — the writer→query handoff. Core contract: the query engine reads this to find the storage target (see "Plugin meta files" above) |
 | `dataset-<writer>.json` | core (`dataset.py`) | Dataset parameters for writer `<writer>` — used by the query engine for verification |
 | Backend-specific shared config | plugin | Any file that is identical across servers and needed by multiple nodes or phases |
 
@@ -175,8 +175,8 @@ Backend-specific shared config examples:
 | DSOS | `dsos-write-session.txt` | Session file listing all participating servers |
 
 **Naming rule**: plugin-written files should use a descriptive prefix.
-`storage-<writer>.json` is the required name for plugin meta. Other files
-use the backend name or a short description as prefix (e.g.
+`ingest-handoff-<writer>.json` is the required name for plugin meta. Other
+files use the backend name or a short description as prefix (e.g.
 `dsosd-directory.json`, not `directory.json`).
 
 #### `nodes/<hostname>/` — per-server scratch
@@ -211,9 +211,9 @@ files. See `OUTPUT.md` for the full specification of each file's structure.
 
 | File pattern | Written by | Contents |
 | --- | --- | --- |
-| `write-<writer>-<host>.json` | each writer | The writer's raw output for that host (counts, timers, checkpoints) |
+| `ingest-<writer>-<host>-raw.json` | each writer | The writer's raw output for that host (counts, timers, checkpoints) |
 | `benchmark-<writer>-<adapter>.json` | `core/bench.py` | Combined benchmark result (write + query stats) |
-| `benchmark-<writer>-live.json` | `core/bench.py` | Live-poll benchmark result |
+| `benchmark-live-<writer>.json` | `core/bench.py` | Live-poll benchmark result |
 
 #### `logs/` — all logs
 
@@ -295,7 +295,7 @@ Every adapter instance receives `self.ctx`, a dict with these keys:
 
 | Key | Contains | Example |
 | --- | --- | --- |
-| `target` | The storage target name, read from the plugin's storage meta file at `meta/storage-<writer>.json`. For SOS/DSOS this is the container name; for InfluxDB it is the measurement name. The query adapter does not need to know how the name was chosen | `monitoring_nested_c` |
+| `target` | The storage target name, read from the plugin's ingest-handoff meta file at `meta/ingest-handoff-<writer>.json`. For SOS/DSOS this is the container name; for InfluxDB it is the measurement name. The query adapter does not need to know how the name was chosen | `monitoring_nested_c` |
 | `schema` | The dataset name from the JSON definition (`DS.name`) — the table name used in query strings and the name verification matches against | `monitoring_nested` |
 | `servers` | List of server hostnames from `SERVER_HOSTS` | `["node-1", "node-2"]` |
 | `output_dir` | This pair's output directory (`OUTPUT_DIR/<pair>/`), with `meta/`, `nodes/`, `results/`, `logs/` subdirectories | `/data/monbench/output/sos-dsos` |

@@ -3,9 +3,9 @@
 # Hooks (see backends/README.md for the contract):
 #   plugin_write       WRITER MODE INDEX ID   write one partition; the plugin
 #                                             uses DS.name as the measurement
-#                                             name and records it in a storage
-#                                             meta file at
-#                                             OUTPUT_DIR/meta/storage-<writer>.json
+#                                             name and records it in an
+#                                             ingest-handoff meta file at
+#                                             OUTPUT_DIR/meta/ingest-handoff-<writer>.json
 #   plugin_serve_start ID                     on the designated server host only;
 #                                             remove data and token of any
 #                                             earlier run, generate a token
@@ -100,13 +100,13 @@ plugin_write() { # WRITER MODE INDEX SERVER_ID
 		--token "$token"
 }
 
-# Write the storage meta file read by the query side.
+# Write the ingest-handoff meta file read by the query side.
 # See EXTENDING.md, "Plugin meta files".
 _influx_write_meta() { # WRITER MEASUREMENT
 	local writer="$1" measurement="$2"
 	local meta_dir="${OUTPUT_DIR}/meta"
 	mkdir -p "$meta_dir"
-	cat >"${meta_dir}/storage-${writer}.json" <<-EOF
+	cat >"${meta_dir}/ingest-handoff-${writer}.json" <<-EOF
 	{
 	  "target": "${measurement}",
 	  "backend": "influxdb",

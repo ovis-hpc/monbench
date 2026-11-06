@@ -12,8 +12,8 @@
 #                                         SOS container; the plugin constructs
 #                                         the storage name from DS.name and the
 #                                         writer name, and records it in a
-#                                         storage meta file at
-#                                         OUTPUT_DIR/meta/storage-<writer>.json
+#                                         ingest-handoff meta file at
+#                                         OUTPUT_DIR/meta/ingest-handoff-<writer>.json
 #   plugin_clean ID                       delete this server's containers
 #                                         (nodes/ and meta/ are removed by
 #                                         the harness)
@@ -104,14 +104,14 @@ plugin_write() { # WRITER MODE INDEX SERVER_ID
 	esac
 }
 
-# Write a storage meta file recording where the writer stored data, so the
+# Write an ingest-handoff meta file recording where the writer stored data, so the
 # query side can find it without reconstructing paths by convention.
 # See EXTENDING.md, "Plugin meta files".
 _sos_write_meta() { # WRITER TARGET SERVER_ID
 	local writer="$1" target="$2" id="$3"
 	local meta_dir="${OUTPUT_DIR}/meta"
 	mkdir -p "$meta_dir"
-	cat >"${meta_dir}/storage-${writer}.json" <<-EOF
+	cat >"${meta_dir}/ingest-handoff-${writer}.json" <<-EOF
 	{
 	  "target": "${target}",
 	  "backend": "sos",

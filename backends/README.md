@@ -25,15 +25,15 @@ contract: config declarations, plugin hooks, writer summary format, plugin
 meta files, query adapter interface, `type_overrides`, and a testing
 walkthrough.
 
-## Storage naming
+## Ingest-handoff naming
 
 Each backend plugin constructs its own storage target name during the write
 phase, using the `ds_name()` helper to read the dataset definition's `"name"`
 field. The plugin records the target name and any other storage-specific
-information in a storage meta file at `meta/storage-<writer>.json` (under
-the pair's `OUTPUT_DIR`). The query engine reads this file to find where the
-data lives — the core never constructs or passes storage target names. See
-`EXTENDING.md`, "Plugin meta files" for the full contract and
+information in an ingest-handoff meta file at `meta/ingest-handoff-<writer>.json`
+(under the pair's `OUTPUT_DIR`). The query engine reads this file to find
+where the data lives — the core never constructs or passes storage target
+names. See `EXTENDING.md`, "Plugin meta files" for the full contract and
 "OUTPUT_DIR layout" for the directory structure.
 
 ## Backends provided

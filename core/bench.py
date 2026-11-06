@@ -23,10 +23,10 @@ The data set parameters come from the writer's metadata file, written when
 the data was written. If it names a different backend, the run stops.
 
 The storage target (container name, measurement, etc.) is determined by
-reading the backend plugin's storage meta file at
-OUTPUT_DIR/meta/storage-<writer>.json, written by the plugin during the
-write phase. This is the writer->query handoff: the plugin decides where
-to store the data, records it, and the query engine reads it back.
+reading the backend plugin's ingest-handoff meta file at
+OUTPUT_DIR/meta/ingest-handoff-<writer>.json, written by the plugin during
+the write phase. This is the writer->query handoff: the plugin decides
+where to store the data, records it, and the query engine reads it back.
 
 '--live' polls a writer that is still writing and checks that every
 answer is internally consistent and that the row count never decreases.
@@ -100,14 +100,14 @@ def load_plugin():
 
 
 def _read_plugin_meta(writer):
-    """Read the backend plugin's storage meta from OUTPUT_DIR/meta/storage-<writer>.json.
+    """Read the backend plugin's ingest-handoff meta from OUTPUT_DIR/meta/ingest-handoff-<writer>.json.
 
     The plugin writes this during the write phase to record where and how
     it stored the data (the target name, paths, database names, etc.).
     Returns None if the file does not exist (e.g. live mode before writing
     finishes).
     """
-    path = os.path.join(OUTPUT_DIR, "meta", f"storage-{writer}.json")
+    path = os.path.join(OUTPUT_DIR, "meta", f"ingest-handoff-{writer}.json")
     if not os.path.exists(path):
         return None
     with open(path) as f:
@@ -494,6 +494,7 @@ class Report:
         self.writer = writer
         self.adapter = adapter
         self.items = []
+        self.raw_queries = []
         self.width = 40
 
     def add(self, label, status, detail, **fields):
@@ -649,12 +650,14 @@ def run_query_set(rep, adapter, queries, mode="both"):
             continue
 
         # 2. Timed runs (query and both modes).
-        times, firsts = [], []
+        times, firsts, runs = [], [], []
         try:
             for i in range(REPEAT):
                 t, n, first = timed_run(adapter, native_query)
                 times.append(t)
                 firsts.append(first)
+                runs.append({"run": i + 1, "duration_s": round(t, 6),
+                             "rows": n, "first_batch_s": round(first, 6)})
                 if nrows == 0 and i == 0:
                     nrows = n       # first timed run establishes the baseline in query-only mode
                 elif n != nrows:
@@ -665,6 +668,11 @@ def run_query_set(rep, adapter, queries, mode="both"):
         if times:
             fields.update(stats.egress(times, nrows, firsts))
         rep.add(label, status, detail, **fields)
+        if runs:
+            rep.raw_queries.append({
+                "name": q["name"], "type": q["type"],
+                "query": q["query"], "rows": nrows, "runs": runs,
+            })
 
 
 def load_dataset(writer, live):
@@ -692,10 +700,10 @@ def load_ingest_results(writer):
     way for every backend.
     """
     import glob
-    pattern = os.path.join(OUTPUT_DIR, "results", f"write-{writer}-*.json")
+    pattern = os.path.join(OUTPUT_DIR, "results", f"ingest-{writer}-*-raw.json")
     found = []                      # (host, raw dict) or (host, error text)
     for f in sorted(glob.glob(pattern)):
-        host = os.path.basename(f).replace(f"write-{writer}-", "").replace(".json", "")
+        host = os.path.basename(f).replace(f"ingest-{writer}-", "").replace("-raw.json", "")
         try:
             with open(f) as fh:
                 raw = json.load(fh)
@@ -883,13 +891,21 @@ def main():
         run_write_summary(a.writer)
         return 0
 
-    suffix = "-live" if a.live else f"-{QUERY_ADAPTER or 'default'}"
-    log_path = os.path.join(OUTPUT_DIR, "logs", f"benchmark-{a.writer}{suffix}.log")
-    tee = Tee(log_path)
+    tmp_log = os.path.join(OUTPUT_DIR, "logs", f"benchmark-{a.writer}-pending.log")
+    tee = Tee(tmp_log)
     try:
         rep = run_live(a.writer) if a.live else run_checks(a.writer, a.queries, mode=a.mode)
     finally:
         tee.close()
+
+    if a.live:
+        result_name = f"benchmark-live-{a.writer}.json"
+        log_name = f"benchmark-live-{a.writer}.log"
+    else:
+        result_name = f"benchmark-{a.writer}-{rep.adapter}.json"
+        log_name = f"benchmark-{a.writer}-{rep.adapter}.log"
+    log_path = os.path.join(OUTPUT_DIR, "logs", log_name)
+    os.rename(tmp_log, log_path)
 
     target = getattr(rep, "target", a.writer)
 
@@ -934,10 +950,28 @@ def main():
         "all_passed": not rep.failed(),
     }
 
-    out = os.path.join(results_dir, f"benchmark-{a.writer}{suffix}.json")
+    out = os.path.join(results_dir, result_name)
     with open(out, "w") as f:
         json.dump(result, f, indent=2)
     print(f"  results: {out}")
+
+    # Write per-run raw query data for downstream analysis.
+    if rep.raw_queries:
+        raw_query = {
+            "writer": a.writer,
+            "target": target,
+            "backend": QUERY_BACKEND,
+            "adapter": rep.adapter,
+            "query_file": None if a.live else a.queries,
+            "repeat": REPEAT,
+            "servers": SERVERS,
+            "queries": rep.raw_queries,
+        }
+        raw_path = os.path.join(results_dir, f"egress-{rep.adapter}-raw.json")
+        with open(raw_path, "w") as f:
+            json.dump(raw_query, f, indent=2)
+        print(f"  raw queries: {raw_path}")
+
     print(f"  log:     {log_path}")
     return 1 if rep.failed() else 0
 

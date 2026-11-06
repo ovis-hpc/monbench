@@ -112,7 +112,7 @@
 #   OUTPUT_DIR/<pair>/ layout (see EXTENDING.md for the full spec):
 #     meta/                backend-level metadata (shared across nodes;
 #                          wiped on clean)
-#       storage-<w>.json     where writer <w> stored data (plugin→query handoff)
+#       ingest-handoff-<w>.json  where writer <w> stored data (plugin→query handoff)
 #       dataset-<w>.json     dataset params for writer <w> (core-written)
 #     nodes/<hostname>/    per-server scratch (wiped on clean)
 #       data/                backend storage (containers, databases)
@@ -398,7 +398,7 @@ phase_write() {
 		ok=1
 		if BE="${WRITE_BACKEND}" on_servers "write-${w}" write "$w" full; then
 			# Record what was written; the plugin wrote storage details to
-			# OUTPUT_DIR/meta/storage-<writer>.json on each server, and this
+			# OUTPUT_DIR/meta/ingest-handoff-<writer>.json on each server, and this
 			# meta step on the query node writes the dataset/params metadata
 			# that the query engine reads. Without it the query side cannot
 			# find the data, so a failed meta step counts as a failed write.

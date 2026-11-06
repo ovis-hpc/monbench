@@ -14,11 +14,12 @@ After a run, `OUTPUT_DIR/<pair>/` contains:
 
 | Directory | Path pattern | Written by | Contents |
 |---|---|---|---|
-| `meta/` | `storage-<writer>.json` | plugin (`plugin_write`) | Where the writer stored data (writer→query handoff) |
+| `meta/` | `ingest-handoff-<writer>.json` | plugin (`plugin_write`) | Where the writer stored data (writer→query handoff) |
 | `meta/` | `dataset-<writer>.json` | `core/dataset.py` | Dataset parameters and writer identity for verification |
-| `results/` | `write-<writer>-<host>.json` | each writer | The writer's raw output for that host: counts, phase timers and checkpoints (no derived numbers) |
+| `results/` | `ingest-<writer>-<host>-raw.json` | each writer | One JSON object per writer run on that host |
 | `results/` | `benchmark-<writer>-<adapter>.json` | `core/bench.py` | Combined benchmark result (see structure below) |
-| `results/` | `benchmark-<writer>-live.json` | `core/bench.py` | Live-poll result (see structure below) |
+| `results/` | `benchmark-live-<writer>.json` | `core/bench.py` | Live-poll result (see structure below) |
+| `results/` | `egress-<adapter>-raw.json` | `core/bench.py` | Per-run raw query timings for downstream analysis (see below) |
 | `logs/` | `<phase>-<host>.log` | the harness | Full stdout/stderr of every remote step |
 | `logs/` | `benchmark-<writer>-<adapter>.log` | `core/bench.py` | Everything printed to stdout during the benchmark |
 
@@ -43,7 +44,7 @@ structure:
 
 The `writer` field is the writer name (e.g. `"c"`, `"py"`, `"influx"`).
 The `target` field is the backend-specific storage target read from the
-plugin's storage meta file at `meta/storage-<writer>.json` — for SOS/DSOS
+plugin's ingest-handoff meta file at `meta/ingest-handoff-<writer>.json` — for SOS/DSOS
 this is the container name (e.g. `"monitoring_nested_c"`), for InfluxDB the
 measurement name (e.g. `"monitoring_nested"`).
 
@@ -73,9 +74,9 @@ write a new `ingest` section.
 
 ### `ingest`
 
-Write-side results. Writers report raw inputs only; `core/stats.py`
-computes everything below from them, identically for every backend (see
-"Statistics" at the end of this file).
+Write-side results, computed by `core/stats.py` from the per-host writer
+JSON files. Every derived number (rates, percentiles, wall time) is
+computed in the core so that every backend is summarized the same way.
 
 ```
 "ingest": {
@@ -89,57 +90,91 @@ computes everything below from them, identically for every backend (see
       "records":               80000,
       "list_entries":          0,
       "errors":                0,
-      "batch":                 500,
+      "batch":                 100,
       "rate":                  0,
-      "open_s":                0.02,
+      "open_s":                0.01,
       "write_s":               1.23,
       "sync_s":                0.45,
       "records_per_s":         65040,
       "durable_records_per_s": 47619,
-      "window_records":        500,
-      "latency_s":        { "n": 160, "min": ..., "p50": ..., "p90": ..., "p95": ..., "p99": ..., "max": ..., "mean": ..., "stddev": ... },
-      "throughput_per_s": { "n": 160, "min": ..., "p50": ..., ... }
+      "window_records":        100,
+      "latency_s":      { "n": 800, "min": ..., "p50": ..., "p90": ..., "p95": ..., "p99": ..., "max": ..., "mean": ..., "stddev": ... },
+      "throughput_per_s": { "n": 800, "min": ..., "p50": ..., ... }
     }
   ],
   "summary": {
-    "hosts":                    2,
-    "total_records":            160000,
-    "total_list_entries":       0,
-    "errors":                   0,
-    "wall_basis":               "wall-clock",
-    "write_wall_s":             1.31,
-    "durable_wall_s":           1.78,
-    "records_per_s":            122137,
-    "durable_records_per_s":    89888,
-    "host_records_per_s_min":   61000,
-    "host_records_per_s_max":   65040,
-    "host_imbalance":           1.07,
-    "latency_s":        { "n": 320, ... },
-    "throughput_per_s": { "n": 320, ... }
+    "hosts":                  2,
+    "total_records":          160000,
+    "total_list_entries":     0,
+    "errors":                 0,
+    "wall_basis":             "wall-clock",
+    "write_wall_s":           1.31,
+    "durable_wall_s":         1.76,
+    "records_per_s":          122137,
+    "durable_records_per_s":  90909,
+    "host_records_per_s_min": 64000,
+    "host_records_per_s_max": 65040,
+    "host_imbalance":         1.02,
+    "latency_s":              { ... },
+    "throughput_per_s":       { ... }
   }
 }
 ```
 
+#### Per-host fields
+
 | Field | Description |
 |---|---|
-| `records_per_s` | records divided by `write_s` (per host), or by the wall time of the whole write phase (summary) |
-| `durable_records_per_s` | the same, with the close/sync time included: the rate at which data reached stable storage |
-| `write_wall_s`, `durable_wall_s` | earliest write start to latest write end across hosts, without and with the sync. `wall_basis` is `wall-clock` when every host reported `start_epoch_s` (the hosts' clocks are then assumed to be synchronized) and `slowest-host` otherwise |
-| `host_imbalance` | fastest host's `records_per_s` divided by the slowest host's |
-| `window_records` | records per window: the writer's `batch` |
-| `latency_s` | summary of how long each window (one batch) took, in seconds |
-| `throughput_per_s` | summary of the records per second achieved in each window |
+| `records` | node-level records written |
+| `list_entries` | list-attribute entries written (0 without list attributes) |
+| `errors` | failed writes |
+| `batch` | the writer's batch size setting |
+| `rate` | the writer's rate setting |
+| `open_s` | container/connection open time |
+| `write_s` | first record inserted → last record committed |
+| `sync_s` | close and flush to stable storage (0 if there is none) |
+| `records_per_s` | `records / write_s` |
+| `durable_records_per_s` | `records / (write_s + sync_s)` |
+| `window_records` | records per batch window (`batch`, or `records` if batch is 0) |
+| `latency_s` | nine-number summary of per-window durations (seconds) |
+| `throughput_per_s` | nine-number summary of per-window throughput (records/s) |
 
-The summary's `latency_s` and `throughput_per_s` pool every host's windows.
-They describe what one server achieved over one batch, not a sum across
-servers. A trailing batch smaller than `batch` is left out of the
-distributions but counts in all totals.
+#### Summary fields
 
-Every summary (`latency_s`, `throughput_per_s`) has the same shape,
-shared with the query statistics: `n`, `min`, `p50`, `p90`, `p95`, `p99`,
-`max`, `mean`, `stddev`. A percentile is `null` when `n` is too small for
-it to be more than the maximum: p50 needs 2 samples, p90 10, p95 20,
-p99 100.
+| Field | Description |
+|---|---|
+| `hosts` | number of writer hosts |
+| `total_records` | sum of all hosts' records |
+| `total_list_entries` | sum of all hosts' list entries |
+| `errors` | sum of all hosts' errors |
+| `wall_basis` | `"wall-clock"` (from host start-epoch timestamps) or `"slowest-host"` (fallback when start epochs are missing) |
+| `write_wall_s` | wall-clock elapsed time for the write phase |
+| `durable_wall_s` | wall-clock elapsed time including sync |
+| `records_per_s` | `total_records / write_wall_s` |
+| `durable_records_per_s` | `total_records / durable_wall_s` |
+| `host_records_per_s_min` | slowest host's `records_per_s` |
+| `host_records_per_s_max` | fastest host's `records_per_s` |
+| `host_imbalance` | `max / min` host rate (null when no host reported a rate) |
+| `latency_s` | nine-number summary of all hosts' windows pooled |
+| `throughput_per_s` | nine-number summary of all hosts' windows pooled |
+
+The pooled latency/throughput series hold every host's windows together:
+they describe the rate each server achieved over a window, not a sum
+across servers.
+
+#### Nine-number summary
+
+Every `latency_s` and `throughput_per_s` object, ingest and query alike,
+has this shape (computed by `core/stats.py`):
+
+```
+{ "n", "min", "p50", "p90", "p95", "p99", "max", "mean", "stddev" }
+```
+
+A percentile is reported only when the series has enough samples for it
+to be more than the maximum (see `stats.min_samples()`); otherwise it is
+`null`. That threshold is 2 for p50, 10 for p90, 20 for p95 and 100 for
+p99.
 
 ### `query`
 
@@ -154,11 +189,15 @@ Query-side results from the benchmark engine.
   "repeat":     20,
   "results": [
     {
-      "name":       "[all] all records",
-      "status":     "PASS",
-      "rows":       160000,
-      "verified":   true,
-      "query":      "SELECT ... WHERE ..."
+      "name":           "[all] all records",
+      "status":         "PASS",
+      "rows":           160000,
+      "verified":       true,
+      "query":          "SELECT ... WHERE ...",
+      "times_s":        [0.123, 0.131, ...],
+      "latency_s":      { "n": 20, "min": ..., "p50": ..., ... },
+      "throughput_per_s": { "n": 20, "min": ..., "p50": ..., ... },
+      "first_batch_s":  { "n": 20, "min": ..., "p50": ..., ... }
     }
   ]
 }
@@ -175,22 +214,80 @@ Query-side results from the benchmark engine.
 | `verified` | `true` if the result was verified against the data set |
 | `query` | the expanded query string that was executed |
 | `times_s` | array of individual run durations in seconds (raw samples) |
-| `latency_s` | summary of `times_s` (`n`, `min`, `p50`, `p90`, `p95`, `p99`, `max`, `mean`, `stddev`) |
-| `throughput_per_s` | the same summary of `rows / time` for each run |
-| `first_batch_s` | the same summary of the time until the first batch of each run had been fetched |
+| `latency_s` | nine-number summary of `times_s` (seconds) |
+| `throughput_per_s` | nine-number summary of `rows / duration` for each run (rows/s) |
+| `first_batch_s` | nine-number summary of time-to-first-batch for each run (seconds) |
 | `detail` | present on `FAIL` entries; describes what went wrong |
 
 When `mode` is `check`, the timing fields (`times_s`, `latency_s`,
-`throughput_per_s`, `first_batch_s`) are absent. When `mode` is `query`, `verified` is
-always `false`.
+`throughput_per_s`, `first_batch_s`) are absent. When `mode` is `query`,
+`verified` is always `false`.
 
 A `DRY` entry (top-level `dry_run` is `true` — see above) has `query`
 present but no timing fields, `rows` is `null`, and `verified` is `false`:
 the query's final text was resolved and reported, but never sent.
 
+
+## Raw query output
+
+The file `results/egress-<adapter>-raw.json` contains the
+per-run raw measurements for every timed query, intended for downstream
+analysis and recomputation of statistics outside the suite.
+
+```
+{
+  "writer":     "c",
+  "target":     "monitoring_nested_c",
+  "backend":    "dsos",
+  "adapter":    "dsos",
+  "query_file": "queries/default.json",
+  "repeat":     20,
+  "servers":    ["server-01", "server-02"],
+  "queries": [
+    {
+      "name":  "[all] all records",
+      "type":  "all",
+      "query": "SELECT ... WHERE ...",
+      "rows":  160000,
+      "runs": [
+        { "run": 1,  "duration_s": 0.123456, "rows": 160000, "first_batch_s": 0.045678 },
+        { "run": 2,  "duration_s": 0.131234, "rows": 160000, "first_batch_s": 0.042345 },
+        ...
+      ]
+    },
+    ...
+  ]
+}
+```
+
+| Field | Description |
+|---|---|
+| `writer` | the writer whose data was queried |
+| `target` | backend-specific storage target |
+| `backend` | query backend name |
+| `adapter` | query adapter name |
+| `query_file` | path to the query set file (`null` for live-poll) |
+| `repeat` | number of timed runs per query |
+| `servers` | server hosts used for the write phase |
+| **Per-query fields** | |
+| `name` | query label from the query set file |
+| `type` | query type (e.g. `all`, `timeseries`, `job`, `latest`) |
+| `query` | the expanded query string |
+| `rows` | number of rows returned (consistent across runs) |
+| `runs` | array of per-run measurements |
+| **Per-run fields** | |
+| `run` | 1-based run number |
+| `duration_s` | total duration: query dispatch → last row fetched (seconds) |
+| `rows` | rows returned in this run |
+| `first_batch_s` | time until the first batch had been fetched (seconds) |
+
+This file is written only when at least one timed query ran successfully.
+It is not written for check-only mode or dry runs.
+
+
 ## Live result JSON
 
-The live result file, `results/benchmark-<writer>-live.json`, uses the same
+The live result file, `results/benchmark-live-<writer>.json`, uses the same
 top-level structure as the standard benchmark result, but its query results
 contain no timing fields. Instead, each entry is a pass/fail check on the
 live-poll behaviour:
@@ -201,7 +298,7 @@ live-poll behaviour:
   "adapter":    "dsos",
   "query_file": null,
   "mode":       "both",
-  "repeat":     20,
+  "repeat":     5,
   "results": [
     { "name": "rows never decrease",       "status": "PASS", "rows": null, "verified": true },
     { "name": "every answer valid",        "status": "PASS", "rows": null, "verified": true },
@@ -228,32 +325,31 @@ Under `DRY_RUN`, `live` reports a single `"live poll"` entry with status
 
 ## What is timed
 
-### Write side — raw timers on the server, statistics in the core
+### Write side — self-timed on the server
 
 Each writer is a standalone program (C binary or Python script) that runs
 on a server host via ssh or srun. The core harness cannot directly time a
-remote process, so each writer records raw measurements and prints them as
-one JSON line. It computes no rate and no percentile; `core/stats.py` does,
-the same way for every backend.
+remote process, so each writer measures and reports its own timing.
 
 The writer's JSON output includes:
 
 | Field | What it covers |
 |---|---|
-| `records`, `list_entries`, `errors` | node records and list entries written; failed writes |
-| `batch`, `rate` | the writer's own settings, echoed |
-| `start_epoch_s` | wall-clock time at which the write began |
-| `open_s` | container or connection open (if the writer has one) |
 | `write_s` | first record inserted → last record committed (the data ingestion itself) |
-| `close_sync_s` | container close and flush to stable storage (0 if there is no such step) |
-| `checkpoints` | `[[seconds since write start, records written so far], ...]`, starting with `[0, 0]`, one entry after each batch has been committed or its request completed, and a last one when the write finished |
+| `close_sync_s` | container close and `os.sync()` (flushing data to stable storage) |
+| `total_s` | container open → sync complete (the full operation) |
+| `records_per_s` | `records / total_s` excluding the open step |
 
-The interval between two checkpoints is one batch. Its duration is the
-batch's latency, and its records divided by its duration is the batch's
-throughput. The exact boundaries differ slightly between writers (the SOS C
-writer includes `sos_container_commit()` in the batch; the InfluxDB writer
-has no sync step), so a batch means "`batch` node records handed to the
-backend and acknowledged" everywhere.
+The exact boundaries differ slightly between writers (the SOS C writer
+includes `sos_container_commit()` in `write_s`; the InfluxDB writer has
+no sync step), but each writer's JSON is self-documenting: only the fields
+it actually measures are present.
+
+Additionally, each writer reports a list of checkpoints: `[[seconds, records], ...]`,
+one entry at the end of every batch (after its commit completed) and a
+final entry when the write finished. `core/stats.py` uses these to compute
+per-batch-window latency and throughput distributions (see the ingest
+section above).
 
 ### Query side — core-timed on the client
 
@@ -278,6 +374,11 @@ network round trips, server-side processing, result deserialization, and
 the `adapter.count(batch)` call inside the loop (deliberately included;
 it is meant to be a trivial operation like `len(batch)`).
 
+The third return value, **time to first batch**, is the duration from query
+dispatch to the moment the first batch of results has been counted. A query
+that returns no results at all reports its total duration as the first-batch
+time.
+
 The adapter's `connect()` and `close()` calls are outside the timed
 region — connection setup is measured once, not per query.
 
@@ -292,35 +393,10 @@ timing is client-perceived because the benchmark engine runs on the query
 host and measures what a real client would experience. These are different
 vantage points by design:
 
-- **Writer timers** let each backend report its own internal phases
-  (open, write, sync, close) and per-batch progress with granularity that
-  the harness cannot observe remotely. Only the raw numbers come from the
-  writer; the statistics are computed by the core.
+- **Writer self-timing** allows each backend to report its own internal
+  phases (open, write, sync, close) with granularity that the harness
+  cannot observe remotely.
 - **Core-timed queries** ensure every adapter is measured the same way,
   from the same vantage point, regardless of backend internals. The
   timing reflects end-to-end latency including network and deserialization,
   which is what matters for query performance.
-
-
-## Statistics
-
-`core/stats.py` computes every reported statistic, for ingest and query
-alike. Each measured series is summarized the same way: `n`, `min`, `p50`,
-`p90`, `p95`, `p99`, `max`, `mean`, `stddev`. Percentiles are linearly
-interpolated between the closest ranks. A percentile is reported only when
-the series has enough samples for it to be more than the maximum, and is
-`null` (shown as `-`) otherwise:
-
-| Percentile | Samples needed |
-|---|---|
-| p50 | 2 |
-| p90 | 10 |
-| p95 | 20 |
-| p99 | 100 |
-
-Nothing assumes a data set size, a batch size or a host count. The number
-of ingest samples is `records / batch` per host (160 per host with the
-defaults, `BATCH=500` and 80,000 records), and the number of query samples
-is `REPEAT` (20 by default). Raise `SAMPLES`/`COMPONENT_IDS_PER_SERVER`,
-lower `BATCH` or raise `REPEAT` to get more samples; the percentiles
-appear as soon as there are enough.

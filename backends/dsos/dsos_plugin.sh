@@ -14,8 +14,8 @@
 #   plugin_write WRITER MODE INDEX ID     write through dsosd; the plugin
 #                                         constructs the storage name from
 #                                         DS.name and the writer, and records
-#                                         it in a storage meta file at
-#                                         OUTPUT_DIR/meta/storage-<writer>.json
+#                                         it in an ingest-handoff meta file at
+#                                         OUTPUT_DIR/meta/ingest-handoff-<writer>.json
 #   plugin_serve_start ID / plugin_serve_run ID / plugin_serve_stop /
 #   plugin_serve_status                   manage dsosd on this server
 #   plugin_clean ID                       delete containers and a stale rpcbind
@@ -104,14 +104,14 @@ plugin_write() { # WRITER MODE INDEX SERVER_ID
 	esac
 }
 
-# Write a storage meta file recording where the writer stored data, so the
+# Write an ingest-handoff meta file recording where the writer stored data, so the
 # query side can find it without reconstructing paths by convention.
 # See EXTENDING.md, "Plugin meta files".
 _dsos_write_meta() { # WRITER TARGET SERVER_ID
 	local writer="$1" target="$2" id="$3"
 	local meta_dir="${OUTPUT_DIR}/meta"
 	mkdir -p "$meta_dir"
-	cat >"${meta_dir}/storage-${writer}.json" <<-EOF
+	cat >"${meta_dir}/ingest-handoff-${writer}.json" <<-EOF
 	{
 	  "target": "${target}",
 	  "backend": "dsos",

@@ -114,7 +114,7 @@ truth for the logical data name (e.g. `"monitoring_nested"`). The core
 never constructs storage target names — that is the plugin's job. Each
 backend plugin constructs its own storage name (a container path, a
 measurement, a database) during the write phase and records it in a **plugin
-meta file** at `OUTPUT_DIR/meta/storage-<writer>.json`. The query engine
+meta file** at `OUTPUT_DIR/meta/ingest-handoff-<writer>.json`. The query engine
 reads that meta file to find where the data was stored.
 
 After each writer finishes, the harness also records dataset parameters in a
@@ -132,7 +132,7 @@ subdirectory layout:
 
 | Subdirectory | Purpose |
 |---|---|
-| `meta/` | Writer→query handoff: each plugin writes `storage-<writer>.json` here during the write phase; the query engine reads it to find where the data was stored |
+| `meta/` | Writer→query handoff: each plugin writes `ingest-handoff-<writer>.json` here during the write phase; the query engine reads it to find where the data was stored |
 | `nodes/<hostname>/data/` | Backend storage (containers, databases) |
 | `nodes/<hostname>/run/` | Runtime files: daemon PIDs, tokens |
 | `nodes/<hostname>/tmp/` | Transient files: schema templates, session files |
@@ -452,10 +452,10 @@ own query file.
 
 ## Output
 
-- `results/write-<writer>-<host>.json`: one JSON object per writer run, with
-  the raw measurements: records written, time to write, time for the final
-  sync, and a checkpoint after every batch. Rates and percentiles are not in
-  this file; the benchmark result below holds them.
+- `results/ingest-<writer>-<host>-raw.json`: one JSON object per writer run,
+  with the raw measurements: records written, time to write, time for the
+  final sync, and a checkpoint after every batch. Rates and percentiles are
+  not in this file; the benchmark result below holds them.
 - `results/meta/dataset-<writer>.json`: what was written by each writer (the
   data set parameters and writer identity).
 - `results/benchmark-<writer>-<adapter>.json`: each query with its
@@ -464,7 +464,7 @@ own query file.
   ingest statistics: records per second (write only and including the final
   sync) per server and for the whole write phase, and latency and throughput
   percentiles over the write batches.
-- `results/benchmark-<writer>-live.json`: live-poll result.
+- `results/benchmark-live-<writer>.json`: live-poll result.
 - `logs/`: the full output of every remote step.
 
 See `OUTPUT.md` for the full JSON structure, what each field means, and
